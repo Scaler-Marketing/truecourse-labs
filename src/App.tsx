@@ -25,6 +25,7 @@ function Lab() {
   const [seedOverride, setSeedOverride] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
   const [pendingExport, setPendingExport] = useState(false);
+  const [videoExportNonce, setVideoExportNonce] = useState(0);
 
   const controls = useDialKit(
     'Noise Field',
@@ -55,9 +56,16 @@ function Lab() {
         endpointSpread: [0.72, 0, 1, 0.01],
         color: '#FFFFFF',
       },
+      Motion: {
+        enabled: false,
+        loopDuration: [8, 2, 30, 0.5],
+        amount: [0.38, 0, 1, 0.01],
+        frameRate: [30, 6, 30, 1],
+      },
       Export: {
         transparentBackground: false,
         exportPng: { type: 'action', label: 'Export PNG' },
+        exportMp4: { type: 'action', label: 'Export MP4' },
         width: [1440, 640, 2400, 10],
         height: [900, 480, 1800, 10],
       },
@@ -70,7 +78,8 @@ function Lab() {
           setNonce((value) => value + 1);
         }
         if (action === 'reset') window.location.reload();
-        if (action === 'Export.exportPng') setPendingExport(true);
+        if (action === 'Export.exportPng' || action === 'exportPng') setPendingExport(true);
+        if (action === 'Export.exportMp4' || action === 'exportMp4') setVideoExportNonce((value) => value + 1);
       },
     },
   );
@@ -78,6 +87,7 @@ function Lab() {
   const settings: NoiseSettings = useMemo(() => {
     const noise = controls.Noise;
     const path = controls.Path;
+    const motion = controls.Motion;
     const exportControls = controls.Export;
     return {
       seed: `${seedOverride ?? noise.seed}:${nonce}`,
@@ -99,11 +109,16 @@ function Lab() {
       pathThickness: path.thickness,
       pathEndpointSpread: path.endpointSpread,
       pathColor: path.color,
+      motionEnabled: motion.enabled,
+      loopDuration: motion.loopDuration,
+      motionAmount: motion.amount,
+      frameRate: Math.round(motion.frameRate),
       transparentBackground: exportControls.transparentBackground,
+      videoExportNonce,
       width: Math.round(exportControls.width),
       height: Math.round(exportControls.height),
     };
-  }, [controls.Export, controls.Noise, controls.Path, nonce, seedOverride]);
+  }, [controls.Export, controls.Motion, controls.Noise, controls.Path, nonce, seedOverride, videoExportNonce]);
 
   const debouncedSettings = useDebouncedValue(settings, 35);
 
