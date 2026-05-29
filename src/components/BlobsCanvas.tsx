@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import * as THREE from 'three';
 import { createRng } from '../generation/random';
 
 const maxBlobLines = 28;
@@ -31,46 +32,54 @@ type BlobLine = {
 };
 
 type GlBundle = {
-  gl: WebGLRenderingContext;
-  program: WebGLProgram;
-  position: number;
-  resolution: WebGLUniformLocation;
-  lineCount: WebGLUniformLocation;
-  normals: WebGLUniformLocation;
-  offsets: WebGLUniformLocation;
-  phases: WebGLUniformLocation;
-  rotationAmplitudes: WebGLUniformLocation;
-  lineWidth: WebGLUniformLocation;
-  cornerRadius: WebGLUniformLocation;
-  timePhase: WebGLUniformLocation;
-  motionAmount: WebGLUniformLocation;
-  backgroundColor: WebGLUniformLocation;
-  blobColor: WebGLUniformLocation;
-  transparentBackground: WebGLUniformLocation;
-  quadBuffer: WebGLBuffer;
+  renderer: THREE.WebGLRenderer;
+  scene: THREE.Scene;
+  camera: THREE.OrthographicCamera;
+  material: THREE.ShaderMaterial;
+  quad: THREE.Mesh<THREE.PlaneGeometry, THREE.ShaderMaterial>;
 };
 
-function compileShader(gl: WebGLRenderingContext, type: number, source: string) {
-  const shader = gl.createShader(type);
-  if (!shader) throw new Error('Could not create shader');
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const info = gl.getShaderInfoLog(shader) ?? 'Unknown shader error';
-    gl.deleteShader(shader);
-    throw new Error(info);
+function createGlBundle(canvas: HTMLCanvasElement): GlBundle | null {
+  let renderer: THREE.WebGLRenderer;
+  try {
+    renderer = new THREE.WebGLRenderer({
+      canvas,
+      alpha: true,
+      antialias: true,
+      preserveDrawingBuffer: true,
+    });
+  } catch {
+    return null;
   }
-  return shader;
-}
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+  renderer.setPixelRatio(1);
 
-function createProgram(gl: WebGLRenderingContext) {
-  const vertex = compileShader(gl, gl.VERTEX_SHADER, `
-    attribute vec2 a_position;
-    void main() {
-      gl_Position = vec4(a_position, 0.0, 1.0);
-    }
-  `);
-  const fragment = compileShader(gl, gl.FRAGMENT_SHADER, `
+  const scene = new THREE.Scene();
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -10, 10);
+  const material = new THREE.ShaderMaterial({
+    depthTest: false,
+    depthWrite: false,
+    uniforms: {
+      u_resolution: { value: new THREE.Vector2(1, 1) },
+      u_lineCount: { value: 0 },
+      u_normals: { value: Array.from({ length: maxBlobLines }, () => new THREE.Vector2()) },
+      u_offsets: { value: new Float32Array(maxBlobLines) },
+      u_phases: { value: new Float32Array(maxBlobLines) },
+      u_rotationAmplitudes: { value: new Float32Array(maxBlobLines) },
+      u_lineWidth: { value: 1 },
+      u_cornerRadius: { value: 1 },
+      u_timePhase: { value: 0 },
+      u_motionAmount: { value: 0 },
+      u_backgroundColor: { value: new THREE.Vector4(0, 0, 0, 1) },
+      u_blobColor: { value: new THREE.Vector4(1, 1, 1, 1) },
+      u_transparentBackground: { value: 0 },
+    },
+    vertexShader: `
+      void main() {
+        gl_Position = vec4(position.xy, 0.0, 1.0);
+      }
+    `,
+    fragmentShader: `
     precision highp float;
 
     #define MAX_LINES 28
@@ -124,23 +133,19 @@ function createProgram(gl: WebGLRenderingContext) {
       vec4 color = mix(background, u_blobColor, blobMix);
       gl_FragColor = color;
     }
-  `);
+    `,
+  });
 
-  const program = gl.createProgram();
-  if (!program) throw new Error('Could not create program');
-  gl.attachShader(program, vertex);
-  gl.attachShader(program, fragment);
-  gl.linkProgram(program);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    throw new Error(gl.getProgramInfoLog(program) ?? 'Could not link program');
-  }
-  return program;
-}
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  scene.add(quad);
 
-function getUniform(gl: WebGLRenderingContext, program: WebGLProgram, name: string) {
-  const uniform = gl.getUniformLocation(program, name);
-  if (!uniform) throw new Error(`Missing uniform ${name}`);
-  return uniform;
+  return {
+    renderer,
+    scene,
+    camera,
+    material,
+    quad,
+  };
 }
 
 function hexToRgba(hex: string, alpha: number) {
@@ -153,50 +158,6 @@ function hexToRgba(hex: string, alpha: number) {
     (value & 255) / 255,
     alpha,
   ] as const;
-}
-
-function createGlBundle(canvas: HTMLCanvasElement): GlBundle | null {
-  const gl = canvas.getContext('webgl', {
-    alpha: true,
-    antialias: true,
-    depth: false,
-    stencil: false,
-    preserveDrawingBuffer: true,
-  });
-  if (!gl) return null;
-
-  const program = createProgram(gl);
-  const quadBuffer = gl.createBuffer();
-  if (!quadBuffer) return null;
-  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-    -1, -1,
-    1, -1,
-    -1, 1,
-    -1, 1,
-    1, -1,
-    1, 1,
-  ]), gl.STATIC_DRAW);
-
-  return {
-    gl,
-    program,
-    position: gl.getAttribLocation(program, 'a_position'),
-    resolution: getUniform(gl, program, 'u_resolution'),
-    lineCount: getUniform(gl, program, 'u_lineCount'),
-    normals: getUniform(gl, program, 'u_normals'),
-    offsets: getUniform(gl, program, 'u_offsets'),
-    phases: getUniform(gl, program, 'u_phases'),
-    rotationAmplitudes: getUniform(gl, program, 'u_rotationAmplitudes'),
-    lineWidth: getUniform(gl, program, 'u_lineWidth'),
-    cornerRadius: getUniform(gl, program, 'u_cornerRadius'),
-    timePhase: getUniform(gl, program, 'u_timePhase'),
-    motionAmount: getUniform(gl, program, 'u_motionAmount'),
-    backgroundColor: getUniform(gl, program, 'u_backgroundColor'),
-    blobColor: getUniform(gl, program, 'u_blobColor'),
-    transparentBackground: getUniform(gl, program, 'u_transparentBackground'),
-    quadBuffer,
-  };
 }
 
 function buildBlobLines(settings: BlobsSettings): BlobLine[] {
@@ -225,18 +186,13 @@ function buildBlobLines(settings: BlobsSettings): BlobLine[] {
 }
 
 function renderBlobs(bundle: GlBundle, lines: BlobLine[], settings: BlobsSettings, phase = 0) {
-  const { gl } = bundle;
-  if (gl.canvas.width !== settings.width) gl.canvas.width = settings.width;
-  if (gl.canvas.height !== settings.height) gl.canvas.height = settings.height;
-
-  const normals = new Float32Array(maxBlobLines * 2);
   const offsets = new Float32Array(maxBlobLines);
   const phases = new Float32Array(maxBlobLines);
   const rotationAmplitudes = new Float32Array(maxBlobLines);
+  const normals = bundle.material.uniforms.u_normals.value as THREE.Vector2[];
 
   lines.forEach((line, index) => {
-    normals[index * 2] = line.normalX;
-    normals[index * 2 + 1] = line.normalY;
+    normals[index].set(line.normalX, line.normalY);
     offsets[index] = line.offset;
     phases[index] = line.phase;
     rotationAmplitudes[index] = line.rotationAmplitude;
@@ -244,26 +200,22 @@ function renderBlobs(bundle: GlBundle, lines: BlobLine[], settings: BlobsSetting
 
   const background = hexToRgba(settings.backgroundColor, 1);
   const blob = hexToRgba(settings.blobColor, 1);
+  const uniforms = bundle.material.uniforms;
 
-  gl.viewport(0, 0, settings.width, settings.height);
-  gl.useProgram(bundle.program);
-  gl.bindBuffer(gl.ARRAY_BUFFER, bundle.quadBuffer);
-  gl.enableVertexAttribArray(bundle.position);
-  gl.vertexAttribPointer(bundle.position, 2, gl.FLOAT, false, 0, 0);
-  gl.uniform2f(bundle.resolution, settings.width, settings.height);
-  gl.uniform1i(bundle.lineCount, lines.length);
-  gl.uniform2fv(bundle.normals, normals);
-  gl.uniform1fv(bundle.offsets, offsets);
-  gl.uniform1fv(bundle.phases, phases);
-  gl.uniform1fv(bundle.rotationAmplitudes, rotationAmplitudes);
-  gl.uniform1f(bundle.lineWidth, settings.lineWidth);
-  gl.uniform1f(bundle.cornerRadius, settings.cornerRadius);
-  gl.uniform1f(bundle.timePhase, phase);
-  gl.uniform1f(bundle.motionAmount, settings.motionEnabled ? settings.motionAmount : 0);
-  gl.uniform4f(bundle.backgroundColor, background[0], background[1], background[2], background[3]);
-  gl.uniform4f(bundle.blobColor, blob[0], blob[1], blob[2], blob[3]);
-  gl.uniform1f(bundle.transparentBackground, settings.transparentBackground ? 1 : 0);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  bundle.renderer.setSize(settings.width, settings.height, false);
+  uniforms.u_resolution.value.set(settings.width, settings.height);
+  uniforms.u_lineCount.value = lines.length;
+  uniforms.u_offsets.value = offsets;
+  uniforms.u_phases.value = phases;
+  uniforms.u_rotationAmplitudes.value = rotationAmplitudes;
+  uniforms.u_lineWidth.value = settings.lineWidth;
+  uniforms.u_cornerRadius.value = settings.cornerRadius;
+  uniforms.u_timePhase.value = phase;
+  uniforms.u_motionAmount.value = settings.motionEnabled ? settings.motionAmount : 0;
+  uniforms.u_backgroundColor.value.set(background[0], background[1], background[2], background[3]);
+  uniforms.u_blobColor.value.set(blob[0], blob[1], blob[2], blob[3]);
+  uniforms.u_transparentBackground.value = settings.transparentBackground ? 1 : 0;
+  bundle.renderer.render(bundle.scene, bundle.camera);
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -346,6 +298,13 @@ export function BlobsCanvas({ settings }: { settings: BlobsSettings }) {
     const canvas = canvasRef.current;
     if (!canvas) return;
     glRef.current = createGlBundle(canvas);
+
+    return () => {
+      glRef.current?.quad.geometry.dispose();
+      glRef.current?.material.dispose();
+      glRef.current?.renderer.dispose();
+      glRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
