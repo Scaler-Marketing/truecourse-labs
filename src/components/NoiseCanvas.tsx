@@ -631,6 +631,7 @@ function drawNoiseTexture(bundle: GlBundle, settings: NoiseSettings, seed: numbe
 function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: number) {
   const weights = new Float32Array(pool.nodes.length);
   const active = new Uint8Array(pool.nodes.length);
+  const connected = new Uint8Array(pool.nodes.length);
   const threshold = 0.38 - settings.nodeDensity * 0.16;
   const lineVertices: number[] = [];
   const lineAlphas: number[] = [];
@@ -647,10 +648,6 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
     const weight = morphValue(node.baseWeight, node.morphWeights, settings, phase);
     weights[node.id] = weight;
     active[node.id] = weight > threshold && node.gate < 0.2 + weight * 0.9 ? 1 : 0;
-    if (active[node.id]) {
-      nodeVertices.push(node.x, node.y);
-      nodeAlphas.push(0.52 + weight * 0.48);
-    }
   }
 
   for (const edge of pool.edges) {
@@ -668,6 +665,8 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
       0.34 + midpointWeight * 0.48,
       settings.organicity * 1.45,
     );
+    connected[edge.a.id] = 1;
+    connected[edge.b.id] = 1;
   }
 
   const stubChance = 0.015 + settings.organicity * 0.075;
@@ -688,8 +687,15 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
       0.28 + stubWeight * 0.38,
       settings.organicity * 1.75,
     );
+    connected[node.id] = 1;
     stubNodeVertices.push(end.x, end.y);
     stubNodeAlphas.push(0.38 + stubWeight * 0.36);
+  }
+
+  for (const node of pool.nodes) {
+    if (!active[node.id] || !connected[node.id]) continue;
+    nodeVertices.push(node.x, node.y);
+    nodeAlphas.push(0.52 + weights[node.id] * 0.48);
   }
 
   return {
@@ -845,7 +851,7 @@ export function NoiseCanvas({ settings }: { settings: NoiseSettings }) {
 
   return (
     <div className="preview-stage">
-      <canvas ref={canvasRef} className="pattern-canvas noise-canvas" aria-label="Weighted network preview" />
+      <canvas ref={canvasRef} className="pattern-canvas lab-canvas noise-canvas" aria-label="Weighted network preview" />
     </div>
   );
 }
