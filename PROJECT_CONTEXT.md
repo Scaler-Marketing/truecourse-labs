@@ -12,8 +12,8 @@ The current app entry path is:
 
 - `src/main.tsx` mounts `App`.
 - `src/App.tsx` builds DialKit controls, maps them into mode-specific settings, debounces `{ mode, values }`, and renders either `NoiseCanvas` or `BlobsCanvas`.
-- `src/components/NoiseCanvas.tsx` owns the `bindings` generation, WebGL rendering, animation loop, PNG target canvas, and MP4/WebM export path.
-- `src/components/BlobsCanvas.tsx` owns the `blobs` shader, WebGL rendering, rotation animation loop, PNG target canvas, and MP4/WebM export path.
+- `src/components/NoiseCanvas.tsx` owns the `bindings` generation, Three.js-backed WebGL rendering, animation loop, PNG target canvas, and MP4/WebM export path.
+- `src/components/BlobsCanvas.tsx` owns the `blobs` shader, Three.js-backed WebGL rendering, rotation animation loop, PNG target canvas, and MP4/WebM export path.
 
 ## Stack And Commands
 
@@ -21,7 +21,7 @@ The current app entry path is:
 - UI controls: `dialkit` via `DialRoot` and `useDialKit`.
 - Icons dependency exists: `lucide-react`, but it is not currently used.
 - Motion dependency exists: `motion`, but it is not currently used.
-- Rendering: direct Canvas/WebGL APIs, no Three.js.
+- Rendering: Three.js-backed WebGL. The active canvases still use custom shader materials and generated buffer geometry, but WebGL context/program management should go through Three.js.
 
 Common commands:
 
@@ -49,6 +49,7 @@ npm.cmd run lint
 - `Shader.mode` selects `bindings` or `blobs`.
 - `Shader.seed` is shared across shader modes.
 - Mode-specific groups are conditional: `Bindings` + `Path` for `bindings`; `Blobs` for `blobs`.
+- Bindings has an internal `Bindings.source` selector. `noise` preserves the original procedural field; `svg` uses an uploaded SVG rasterized to a black/white 2D mask.
 - Shared groups are `Motion` and `Export`.
 - Settings are memoized as `{ mode, values }` and debounced by `35ms` before rendering/export. Keep mode and values coupled so `BlobsCanvas` never receives stale `NoiseSettings` during mode switches.
 - `refresh` increments `nonce`, which is appended to the seed.
@@ -74,15 +75,15 @@ Important types:
 - `PoolNode`: generated node with stable gate, base noise weight, morph weights, and optional stub geometry.
 - `PoolEdge`: generated edge between two pool nodes with gate, angle score, base weight, and morph weights.
 - `PatternPool`: generated nodes, edges, and highlighted path edge ids.
-- `GlBundle`: WebGL context, shader programs, attribute locations, and uniforms.
+- `GlBundle`: Three.js renderer, scene, orthographic camera, and shader materials.
 
 Core pipeline:
 
 1. `hashSeed(settings.seed)` creates deterministic randomness.
-2. `buildPatternPool(settings)` creates a jittered grid of candidate nodes, spatial buckets, direction-aware edges, and optional path edges.
+2. `buildPatternPool(settings, mask)` creates a jittered grid of candidate nodes, spatial buckets, direction-aware edges, and optional path edges. In `noise` source mode, node/edge weights come from procedural noise. In `svg` source mode, weights come from the uploaded SVG mask.
 3. `buildFrameGeometry(pool, settings, phase)` filters active nodes/edges for the current noise/motion phase and builds line/point vertex arrays.
-4. `renderWebgl(bundle, pool, settings, phase)` clears the canvas, optionally draws the noise map texture, then draws base lines, stubs, path lines, nodes, and stub nodes.
-5. `NoiseCanvas` creates one WebGL bundle on mount, rebuilds the pattern pool when settings change, and only runs `requestAnimationFrame` when `motionEnabled` is true.
+4. `renderWebgl(bundle, pool, settings, phase)` clears the Three.js renderer, optionally draws the noise map texture, then draws base lines, stubs, path lines, nodes, and stub nodes.
+5. `NoiseCanvas` creates one Three.js bundle on mount, rebuilds the pattern pool when settings change, and only runs `requestAnimationFrame` when `motionEnabled` is true.
 
 Noise and motion notes:
 
@@ -90,6 +91,16 @@ Noise and motion notes:
 - Motion morphs between four precomputed noise weights per node/edge/stub.
 - `motionAmount` controls blend strength; `loopDuration` controls the phase cycle.
 - `frameRate` throttles the animation loop and is also used for video export.
+
+SVG source notes:
+
+- `Bindings.loadSvg` opens a hidden file input in `App.tsx` and stores the SVG as a data URL.
+- SVG controls live in the `SVG` group. `mode` switches between `2D` and `3D`; shared placement controls are `positionX`, `positionY`, and `scale`.
+- `SVG.noise` turns the SVG into a mask over the procedural noise field. When enabled, SVG exposes the noise-only controls (`size`, `complexity`, `contrast`, `brightness`) and Motion animates the clipped noise by interpolating between seeds.
+- `createSvgMask(settings)` draws the SVG into an offscreen canvas, converts its alpha silhouette to white on black, and exposes pixels as the field mask.
+- In `SVG.mode = 3D`, `SVGLoader` converts the upload to shapes, `ExtrudeGeometry` gives it depth from `SVG.extrude`, and a cached offscreen Three.js scene renders a white 3D silhouette into the mask. `OrbitControls` are attached to the visible canvas with orbit and pan enabled; camera changes reuse the cached extruded geometry and only rerender/read the mask. The extruded shapes sit inside a centered pivot group, so if `Motion.enabled` and `SVG.animate` are true, the SVG rotates around its own center while the mask drives the same bindings post-processing.
+- SVG connections keep visible organic curves by trying the requested organicity first, then progressively reducing it only when the sampled curve would leave the SVG mask.
+- SVG source mode intentionally reuses the same nodes/connections/path post-processing as noise source mode.
 
 Path notes:
 
@@ -100,8 +111,8 @@ Path notes:
 
 Export notes:
 
-- PNG export uses the visible `.noise-canvas`; WebGL uses `preserveDrawingBuffer: true` for readback.
-- Video export creates an offscreen canvas and WebGL bundle, records with `canvas.captureStream(fps)`, drives frames manually, and downloads `mp4` if supported, otherwise `webm`.
+- PNG export uses the visible `.noise-canvas`; the Three.js renderer uses `preserveDrawingBuffer: true` for readback.
+- Video export creates an offscreen canvas and Three.js bundle, records with `canvas.captureStream(fps)`, drives frames manually, and downloads `mp4` if supported, otherwise `webm`.
 - `preferredVideoMimeType()` tries MP4 first, then WebM.
 
 ## Blobs Generation And Rendering
@@ -112,7 +123,7 @@ Important types:
 
 - `BlobsSettings`: prop contract from `App`.
 - `BlobLine`: deterministic line definition with normal, offset, phase, and rotation amplitude.
-- `GlBundle`: WebGL context, shader program, uniform locations, and static full-screen quad buffer.
+- `GlBundle`: Three.js renderer, scene, orthographic camera, full-screen quad mesh, and shader material.
 
 Core pipeline:
 
@@ -136,7 +147,7 @@ Blobs controls:
 
 Blobs performance notes:
 
-- Rendering is GPU fragment-shader based for animation performance.
+- Rendering is GPU fragment-shader based through a Three.js full-screen quad for animation performance.
 - The only per-frame work is uniform upload and one full-screen quad draw.
 - Keep `maxBlobLines` modest unless profiling proves higher counts are safe; nested intersection checks run in the fragment shader.
 - Motion should remain rotation-based unless product direction changes.
@@ -176,8 +187,8 @@ Current caution:
 - `src/App.tsx`: app state, DialKit controls, settings mapping, PNG export trigger, layout shell.
 - `src/App.css`: app layout, canvas stage, right control rail, mobile layout.
 - `src/index.css`: global base styles.
-- `src/components/NoiseCanvas.tsx`: `bindings` generator, WebGL renderer, animation, PNG canvas target, loop video export.
-- `src/components/BlobsCanvas.tsx`: `blobs` SDF shader, WebGL renderer, rotation animation, PNG canvas target, loop video export.
+- `src/components/NoiseCanvas.tsx`: `bindings` generator, Three.js renderer, animation, PNG canvas target, loop video export.
+- `src/components/BlobsCanvas.tsx`: `blobs` SDF shader, Three.js renderer, rotation animation, PNG canvas target, loop video export.
 - `src/components/PatternCanvas.tsx`: secondary renderer component for `GeneratedPattern`, not used by current app.
 - `src/generation/random.ts`: shared seed hashing and RNG helpers; used by both systems.
 - `src/generation/pattern.ts`: secondary filament graph generator.
@@ -209,10 +220,12 @@ Avoid adding marketing sections or explanatory in-app text unless explicitly req
 - When changing controls, update the DialKit schema in `App.tsx` and the relevant settings type: `NoiseSettings` in `NoiseCanvas.tsx` or `BlobsSettings` in `BlobsCanvas.tsx`.
 - Keep `LabSettings` in `App.tsx` as `{ mode, values }`; this prevents stale settings from the previous shader mode being rendered during the debounce window.
 - Keep generated artwork deterministic for a given `settings.seed`; random behavior should be derived from `hashSeed`.
-- Be careful with WebGL resource churn. Rendering currently creates/deletes buffers per draw call and creates textures for the optional map overlay; for performance work, profile this area first.
+- Be careful with Three.js resource churn. Bindings currently creates/disposes temporary buffer geometries per draw pass and creates a temporary texture for the optional map overlay; for performance work, profile this area first.
 - `buildPatternPool(settings)` can be expensive because it rebuilds all nodes/edges. Settings are debounced in `App.tsx`; preserve that or replace it with an intentional memoization strategy.
 - Canvas display is stretched to fill the work area with CSS. Export dimensions come from `Export.width` and `Export.height`, not the browser viewport.
 - `transparentBackground` affects WebGL clear alpha and exports, but the surrounding `.preview-stage` still has a CSS background.
+- `NoiseCanvas` fits the visible preview into the work area using the current export `width / height` aspect ratio. The WebGL canvas still renders at the configured export dimensions, so SVG masks, OrbitControls camera aspect, PNG, and MP4 should share the same composition.
+- MP4 export freezes the current SVG 3D OrbitControls camera position/target at click time and reuses it for every exported mask frame. The recorder is driven by `loopDuration` wall-clock time so expensive 3D mask generation does not stretch an 8s loop into a multi-minute video.
 - `lineWidth` in WebGL may have limited effect across browsers/platforms. If precise thick lines become important, implement geometry-based strokes instead of relying on `gl.lineWidth`.
 - `MediaRecorder` MP4 support varies by browser. Keep WebM fallback unless product requirements say otherwise.
 - Do not assume the secondary `PatternSettings` system is dead; it contains useful SVG/shape/export logic, but it is not the active UI path.

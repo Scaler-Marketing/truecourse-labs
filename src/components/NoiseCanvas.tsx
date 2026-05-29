@@ -1,8 +1,20 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { SVGLoader } from 'three/examples/jsm/loaders/SVGLoader.js';
 import { hashSeed } from '../generation/random';
 
 export type NoiseSettings = {
   seed: string;
+  source: 'noise' | 'svg';
+  svgDataUrl: string | null;
+  svgMode: '2d' | '3d';
+  svgNoiseEnabled: boolean;
+  svgPositionX: number;
+  svgPositionY: number;
+  svgScale: number;
+  svgExtrude: number;
+  svgAnimate: boolean;
   size: number;
   complexity: number;
   contrast: number;
@@ -61,24 +73,49 @@ type PatternPool = {
   pathEdges: Set<number>;
 };
 
+type FieldMask = {
+  width: number;
+  height: number;
+  pixels: Uint8ClampedArray;
+};
+
+type SvgOrbit = {
+  position: THREE.Vector3;
+  target: THREE.Vector3;
+};
+
+type PreviewSize = {
+  width: number;
+  height: number;
+};
+
+type Svg3dMaskCache = {
+  key: string;
+  renderer: THREE.WebGLRenderer;
+  scene: THREE.Scene;
+  camera: THREE.PerspectiveCamera;
+  group: THREE.Group;
+  material: THREE.MeshBasicMaterial;
+  canvas: HTMLCanvasElement;
+  maskContext: CanvasRenderingContext2D;
+};
+
+let svg3dMaskCache: Svg3dMaskCache | null = null;
+
+function cloneOrbit(orbit: SvgOrbit | null): SvgOrbit | null {
+  if (!orbit) return null;
+  return {
+    position: orbit.position.clone(),
+    target: orbit.target.clone(),
+  };
+}
+
 type GlBundle = {
-  gl: WebGLRenderingContext;
-  line: WebGLProgram;
-  point: WebGLProgram;
-  texture: WebGLProgram;
-  linePosition: number;
-  lineAlpha: number;
-  lineResolution: WebGLUniformLocation;
-  lineColor: WebGLUniformLocation;
-  pointPosition: number;
-  pointAlpha: number;
-  pointResolution: WebGLUniformLocation;
-  pointColor: WebGLUniformLocation;
-  pointSize: WebGLUniformLocation;
-  texturePosition: number;
-  textureUv: number;
-  textureSampler: WebGLUniformLocation;
-  textureAlpha: WebGLUniformLocation;
+  renderer: THREE.WebGLRenderer;
+  scene: THREE.Scene;
+  camera: THREE.OrthographicCamera;
+  lineMaterial: THREE.ShaderMaterial;
+  pointMaterial: THREE.ShaderMaterial;
 };
 
 function smoothstep(t: number) {
@@ -150,6 +187,31 @@ function sampleNoiseField(seed: number, x: number, y: number, settings: NoiseSet
   return Math.max(0, Math.min(1, contrasted * (0.52 + settings.brightness)));
 }
 
+function sampleMask(mask: FieldMask | null, x: number, y: number) {
+  if (!mask) return 0;
+  const px = Math.max(0, Math.min(mask.width - 1, Math.round(x)));
+  const py = Math.max(0, Math.min(mask.height - 1, Math.round(y)));
+  return mask.pixels[(py * mask.width + px) * 4] / 255;
+}
+
+function sampleSourceField(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null, phase = 0) {
+  if (settings.source === 'svg') {
+    const maskValue = sampleMask(mask, x, y);
+    if (!settings.svgNoiseEnabled) return maskValue;
+    return maskValue * sampleNoise(seed, x, y, settings, phase);
+  }
+  return sampleNoise(seed, x, y, settings, phase);
+}
+
+function sampleSourceBaseField(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null) {
+  if (settings.source === 'svg') {
+    const maskValue = sampleMask(mask, x, y);
+    if (!settings.svgNoiseEnabled) return maskValue;
+    return maskValue * sampleNoiseField(seed, x, y, settings);
+  }
+  return sampleNoiseField(seed, x, y, settings);
+}
+
 function sampleNoise(seed: number, x: number, y: number, settings: NoiseSettings, phase = 0) {
   if (!settings.motionEnabled || settings.motionAmount <= 0.001) return sampleNoiseField(seed, x, y, settings);
   const seedStep = 8191;
@@ -164,13 +226,17 @@ function sampleNoise(seed: number, x: number, y: number, settings: NoiseSettings
   return base + (morphed - base) * settings.motionAmount;
 }
 
-function buildMorphWeights(seed: number, x: number, y: number, settings: NoiseSettings) {
+function buildMorphWeights(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null) {
+  if (settings.source === 'svg' && !settings.svgNoiseEnabled) {
+    const value = sampleSourceBaseField(seed, x, y, settings, mask);
+    return [value, value, value, value] as [number, number, number, number];
+  }
   const seedStep = 8191;
   return [
-    sampleNoiseField(seed, x, y, settings),
-    sampleNoiseField(seed + seedStep, x, y, settings),
-    sampleNoiseField(seed + seedStep * 2, x, y, settings),
-    sampleNoiseField(seed + seedStep * 3, x, y, settings),
+    sampleSourceBaseField(seed, x, y, settings, mask),
+    sampleSourceBaseField(seed + seedStep, x, y, settings, mask),
+    sampleSourceBaseField(seed + seedStep * 2, x, y, settings, mask),
+    sampleSourceBaseField(seed + seedStep * 3, x, y, settings, mask),
   ] as [number, number, number, number];
 }
 
@@ -203,7 +269,7 @@ function keyFor(x: number, y: number, cell: number) {
   return `${Math.floor(x / cell)}:${Math.floor(y / cell)}`;
 }
 
-function buildPatternPool(settings: NoiseSettings): PatternPool {
+function buildPatternPool(settings: NoiseSettings, mask: FieldMask | null): PatternPool {
   const seed = hashSeed(settings.seed);
   const random = rng(seed + 17);
   const nodes: PoolNode[] = [];
@@ -226,10 +292,10 @@ function buildPatternPool(settings: NoiseSettings): PatternPool {
         x: px,
         y: py,
         gate: random(),
-        baseWeight: sampleNoiseField(seed, px, py, settings),
-        morphWeights: buildMorphWeights(seed, px, py, settings),
-        stubBaseWeight: sampleNoiseField(seed, stubX, stubY, settings),
-        stubMorphWeights: buildMorphWeights(seed, stubX, stubY, settings),
+        baseWeight: sampleSourceBaseField(seed, px, py, settings, mask),
+        morphWeights: buildMorphWeights(seed, px, py, settings, mask),
+        stubBaseWeight: sampleSourceBaseField(seed, stubX, stubY, settings, mask),
+        stubMorphWeights: buildMorphWeights(seed, stubX, stubY, settings, mask),
         stubGate: random(),
         stubAngle,
         stubLength,
@@ -287,8 +353,8 @@ function buildPatternPool(settings: NoiseSettings): PatternPool {
         b: candidate.other,
         gate: random(),
         angle: candidate.angle,
-        baseWeight: sampleNoiseField(seed, (node.x + candidate.other.x) * 0.5, (node.y + candidate.other.y) * 0.5, settings),
-        morphWeights: buildMorphWeights(seed, (node.x + candidate.other.x) * 0.5, (node.y + candidate.other.y) * 0.5, settings),
+        baseWeight: sampleSourceBaseField(seed, (node.x + candidate.other.x) * 0.5, (node.y + candidate.other.y) * 0.5, settings, mask),
+        morphWeights: buildMorphWeights(seed, (node.x + candidate.other.x) * 0.5, (node.y + candidate.other.y) * 0.5, settings, mask),
       });
     }
   }
@@ -375,81 +441,69 @@ function findPoolPathEdges(nodes: PoolNode[], edges: PoolEdge[], settings: Noise
   return path;
 }
 
-function compileShader(gl: WebGLRenderingContext, type: number, source: string) {
-  const shader = gl.createShader(type);
-  if (!shader) throw new Error('Could not create shader');
-  gl.shaderSource(shader, source);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const info = gl.getShaderInfoLog(shader) ?? 'Unknown shader error';
-    gl.deleteShader(shader);
-    throw new Error(info);
-  }
-  return shader;
-}
-
-function createProgram(gl: WebGLRenderingContext, vertexSource: string, fragmentSource: string) {
-  const program = gl.createProgram();
-  if (!program) throw new Error('Could not create program');
-  const vertex = compileShader(gl, gl.VERTEX_SHADER, vertexSource);
-  const fragment = compileShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
-  gl.attachShader(program, vertex);
-  gl.attachShader(program, fragment);
-  gl.linkProgram(program);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    throw new Error(gl.getProgramInfoLog(program) ?? 'Could not link program');
-  }
-  return program;
-}
-
-function getUniform(gl: WebGLRenderingContext, program: WebGLProgram, name: string) {
-  const uniform = gl.getUniformLocation(program, name);
-  if (!uniform) throw new Error(`Missing uniform ${name}`);
-  return uniform;
-}
-
 function createGlBundle(canvas: HTMLCanvasElement): GlBundle | null {
-  const gl = canvas.getContext('webgl', {
-    alpha: true,
-    antialias: true,
-    depth: false,
-    stencil: false,
-    preserveDrawingBuffer: true,
-  });
-  if (!gl) return null;
+  let renderer: THREE.WebGLRenderer;
+  try {
+    renderer = new THREE.WebGLRenderer({
+      canvas,
+      alpha: true,
+      antialias: true,
+      preserveDrawingBuffer: true,
+    });
+  } catch {
+    return null;
+  }
+  renderer.autoClear = false;
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+  renderer.setPixelRatio(1);
 
-  const line = createProgram(gl, `
-    attribute vec2 a_position;
+  const scene = new THREE.Scene();
+  const camera = new THREE.OrthographicCamera(0, 1, 0, 1, -10, 10);
+
+  const lineMaterial = new THREE.ShaderMaterial({
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    uniforms: {
+      u_color: { value: new THREE.Vector4(1, 1, 1, 1) },
+    },
+    vertexShader: `
     attribute float a_alpha;
-    uniform vec2 u_resolution;
     varying float v_alpha;
     void main() {
-      vec2 clip = (a_position / u_resolution) * 2.0 - 1.0;
-      gl_Position = vec4(clip * vec2(1.0, -1.0), 0.0, 1.0);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       v_alpha = a_alpha;
     }
-  `, `
+    `,
+    fragmentShader: `
     precision mediump float;
     uniform vec4 u_color;
     varying float v_alpha;
     void main() {
       gl_FragColor = vec4(u_color.rgb, u_color.a * v_alpha);
     }
-  `);
+    `,
+  });
 
-  const point = createProgram(gl, `
-    attribute vec2 a_position;
+  const pointMaterial = new THREE.ShaderMaterial({
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    uniforms: {
+      u_color: { value: new THREE.Vector4(1, 1, 1, 1) },
+      u_pointSize: { value: 1 },
+    },
+    vertexShader: `
     attribute float a_alpha;
-    uniform vec2 u_resolution;
     uniform float u_pointSize;
     varying float v_alpha;
     void main() {
-      vec2 clip = (a_position / u_resolution) * 2.0 - 1.0;
-      gl_Position = vec4(clip * vec2(1.0, -1.0), 0.0, 1.0);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       gl_PointSize = u_pointSize;
       v_alpha = a_alpha;
     }
-  `, `
+    `,
+    fragmentShader: `
     precision mediump float;
     uniform vec4 u_color;
     varying float v_alpha;
@@ -459,81 +513,51 @@ function createGlBundle(canvas: HTMLCanvasElement): GlBundle | null {
       float edge = smoothstep(0.5, 0.32, d);
       gl_FragColor = vec4(u_color.rgb, u_color.a * v_alpha * edge);
     }
-  `);
-
-  const texture = createProgram(gl, `
-    attribute vec2 a_position;
-    attribute vec2 a_uv;
-    varying vec2 v_uv;
-    void main() {
-      gl_Position = vec4(a_position, 0.0, 1.0);
-      v_uv = a_uv;
-    }
-  `, `
-    precision mediump float;
-    uniform sampler2D u_texture;
-    uniform float u_alpha;
-    varying vec2 v_uv;
-    void main() {
-      float v = texture2D(u_texture, v_uv).r;
-      gl_FragColor = vec4(vec3(v), u_alpha);
-    }
-  `);
+    `,
+  });
 
   return {
-    gl,
-    line,
-    point,
-    texture,
-    linePosition: gl.getAttribLocation(line, 'a_position'),
-    lineAlpha: gl.getAttribLocation(line, 'a_alpha'),
-    lineResolution: getUniform(gl, line, 'u_resolution'),
-    lineColor: getUniform(gl, line, 'u_color'),
-    pointPosition: gl.getAttribLocation(point, 'a_position'),
-    pointAlpha: gl.getAttribLocation(point, 'a_alpha'),
-    pointResolution: getUniform(gl, point, 'u_resolution'),
-    pointColor: getUniform(gl, point, 'u_color'),
-    pointSize: getUniform(gl, point, 'u_pointSize'),
-    texturePosition: gl.getAttribLocation(texture, 'a_position'),
-    textureUv: gl.getAttribLocation(texture, 'a_uv'),
-    textureSampler: getUniform(gl, texture, 'u_texture'),
-    textureAlpha: getUniform(gl, texture, 'u_alpha'),
+    renderer,
+    scene,
+    camera,
+    lineMaterial,
+    pointMaterial,
   };
-}
-
-function uploadAttribute(gl: WebGLRenderingContext, attribute: number, size: number, values: Float32Array) {
-  const buffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-  gl.bufferData(gl.ARRAY_BUFFER, values, gl.STREAM_DRAW);
-  gl.enableVertexAttribArray(attribute);
-  gl.vertexAttribPointer(attribute, size, gl.FLOAT, false, 0, 0);
-  return buffer;
 }
 
 function drawVertices(
   bundle: GlBundle,
-  program: WebGLProgram,
-  positionAttribute: number,
-  alphaAttribute: number,
-  resolutionUniform: WebGLUniformLocation,
-  colorUniform: WebGLUniformLocation,
   vertices: number[],
   alphas: number[],
-  mode: number,
+  mode: 'lines' | 'points',
   color: readonly number[],
   pointSize?: number,
 ) {
   if (!vertices.length) return;
-  const { gl } = bundle;
-  gl.useProgram(program);
-  gl.uniform2f(resolutionUniform, gl.canvas.width, gl.canvas.height);
-  gl.uniform4f(colorUniform, color[0], color[1], color[2], color[3]);
-  if (pointSize !== undefined) gl.uniform1f(bundle.pointSize, pointSize);
-  const positionBuffer = uploadAttribute(gl, positionAttribute, 2, new Float32Array(vertices));
-  const alphaBuffer = uploadAttribute(gl, alphaAttribute, 1, new Float32Array(alphas));
-  gl.drawArrays(mode, 0, vertices.length / 2);
-  gl.deleteBuffer(positionBuffer);
-  gl.deleteBuffer(alphaBuffer);
+  const positions = new Float32Array((vertices.length / 2) * 3);
+  for (let i = 0, j = 0; i < vertices.length; i += 2, j += 3) {
+    positions[j] = vertices[i];
+    positions[j + 1] = vertices[i + 1];
+    positions[j + 2] = 0;
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('a_alpha', new THREE.BufferAttribute(new Float32Array(alphas), 1));
+
+  const material = mode === 'points' ? bundle.pointMaterial : bundle.lineMaterial;
+  material.uniforms.u_color.value.set(color[0], color[1], color[2], color[3]);
+  if (mode === 'points' && pointSize !== undefined) {
+    bundle.pointMaterial.uniforms.u_pointSize.value = pointSize;
+  }
+
+  const object = mode === 'points'
+    ? new THREE.Points(geometry, material)
+    : new THREE.LineSegments(geometry, material);
+  bundle.scene.add(object);
+  bundle.renderer.render(bundle.scene, bundle.camera);
+  bundle.scene.remove(object);
+  geometry.dispose();
 }
 
 function curveControlPoint(a: { x: number; y: number }, b: { x: number; y: number }, organicity: number) {
@@ -588,51 +612,86 @@ function pushConnection(
   }
 }
 
-function drawNoiseTexture(bundle: GlBundle, settings: NoiseSettings, seed: number, phase: number) {
-  if (!settings.showMap) return;
-  const { gl } = bundle;
+function connectionStaysInMask(
+  mask: FieldMask | null,
+  settings: NoiseSettings,
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+  organicity: number,
+) {
+  if (settings.source !== 'svg') return true;
+  if (!mask) return false;
+
+  const control = curveControlPoint(a, b, organicity);
+  const samples = 7;
+  for (let i = 0; i <= samples; i += 1) {
+    const t = i / samples;
+    const point = control ? quadraticPoint(a, control, b, t) : {
+      x: a.x + (b.x - a.x) * t,
+      y: a.y + (b.y - a.y) * t,
+    };
+    if (sampleMask(mask, point.x, point.y) < 0.48) return false;
+  }
+
+  return true;
+}
+
+function maskedOrganicity(
+  mask: FieldMask | null,
+  settings: NoiseSettings,
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+  desired: number,
+) {
+  if (settings.source !== 'svg') return desired;
+  const attempts = [desired, desired * 0.7, desired * 0.4, 0];
+  for (const organicity of attempts) {
+    if (connectionStaysInMask(mask, settings, a, b, organicity)) return organicity;
+  }
+  return null;
+}
+
+function drawNoiseMapOverlay(canvas: HTMLCanvasElement | null, settings: NoiseSettings, seed: number, phase: number, mask: FieldMask | null) {
+  if (!canvas) return;
+  const context = canvas.getContext('2d');
+  if (!context) return;
   const scale = 8;
   const width = Math.ceil(settings.width / scale);
   const height = Math.ceil(settings.height / scale);
+
+  if (!settings.showMap) {
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    canvas.hidden = true;
+    return;
+  }
+
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  canvas.hidden = false;
+
+  const image = context.createImageData(width, height);
   const pixels = new Uint8Array(width * height * 4);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      const value = Math.round(sampleNoise(seed, x * scale, y * scale, settings, phase) * 255);
+      const value = Math.round(sampleSourceField(seed, x * scale, y * scale, settings, mask, phase) * 255);
       const index = (y * width + x) * 4;
       pixels[index] = value;
       pixels[index + 1] = value;
       pixels[index + 2] = value;
-      pixels[index + 3] = 255;
+      pixels[index + 3] = 120;
     }
   }
-
-  const texture = gl.createTexture();
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-
-  gl.useProgram(bundle.texture);
-  gl.uniform1i(bundle.textureSampler, 0);
-  gl.uniform1f(bundle.textureAlpha, 0.32);
-  const vertices = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]);
-  const uvs = new Float32Array([0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0]);
-  const positionBuffer = uploadAttribute(gl, bundle.texturePosition, 2, vertices);
-  const uvBuffer = uploadAttribute(gl, bundle.textureUv, 2, uvs);
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-  gl.deleteBuffer(positionBuffer);
-  gl.deleteBuffer(uvBuffer);
-  gl.deleteTexture(texture);
+  image.data.set(pixels);
+  context.putImageData(image, 0, 0);
 }
 
-function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: number) {
+function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: number, mask: FieldMask | null) {
   const weights = new Float32Array(pool.nodes.length);
   const active = new Uint8Array(pool.nodes.length);
   const connected = new Uint8Array(pool.nodes.length);
-  const threshold = 0.38 - settings.nodeDensity * 0.16;
+  const threshold = settings.source === 'svg'
+    ? (settings.svgNoiseEnabled ? 0.26 : 0.5)
+    : 0.38 - settings.nodeDensity * 0.16;
   const lineVertices: number[] = [];
   const lineAlphas: number[] = [];
   const pathVertices: number[] = [];
@@ -653,17 +712,20 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   for (const edge of pool.edges) {
     if (!active[edge.a.id] || !active[edge.b.id]) continue;
     const midpointWeight = morphValue(edge.baseWeight, edge.morphWeights, settings, phase);
-    if (midpointWeight < 0.22) continue;
+    if (midpointWeight < (settings.source === 'svg' ? (settings.svgNoiseEnabled ? 0.24 : 0.5) : 0.22)) continue;
     if (edge.gate >= 0.16 + settings.connectionDensity * 0.46 + edge.angle * settings.angleBias * 0.24) continue;
     const targetVertices = pool.pathEdges.has(edge.id) ? pathVertices : lineVertices;
     const targetAlphas = pool.pathEdges.has(edge.id) ? pathAlphas : lineAlphas;
+    const desiredOrganicity = settings.source === 'svg' ? settings.organicity * 1.25 : settings.organicity * 1.45;
+    const organicity = maskedOrganicity(mask, settings, edge.a, edge.b, desiredOrganicity);
+    if (organicity === null) continue;
     pushConnection(
       targetVertices,
       targetAlphas,
       edge.a,
       edge.b,
       0.34 + midpointWeight * 0.48,
-      settings.organicity * 1.45,
+      organicity,
     );
     connected[edge.a.id] = 1;
     connected[edge.b.id] = 1;
@@ -678,14 +740,17 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
     };
     if (end.x <= 0 || end.x >= settings.width || end.y <= 0 || end.y >= settings.height) continue;
     const stubWeight = morphValue(node.stubBaseWeight, node.stubMorphWeights, settings, phase);
-    if (stubWeight < 0.18) continue;
+    if (stubWeight < (settings.source === 'svg' ? 0.58 : 0.18)) continue;
+    const desiredOrganicity = settings.source === 'svg' ? settings.organicity * 0.95 : settings.organicity * 1.75;
+    const organicity = maskedOrganicity(mask, settings, node, end, desiredOrganicity);
+    if (organicity === null) continue;
     pushConnection(
       stubVertices,
       stubAlphas,
       node,
       end,
       0.28 + stubWeight * 0.38,
-      settings.organicity * 1.75,
+      organicity,
     );
     connected[node.id] = 1;
     stubNodeVertices.push(end.x, end.y);
@@ -712,30 +777,25 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   };
 }
 
-function renderWebgl(bundle: GlBundle, pool: PatternPool, settings: NoiseSettings, phase = 0) {
-  const { gl } = bundle;
+function renderWebgl(bundle: GlBundle, pool: PatternPool, settings: NoiseSettings, mask: FieldMask | null, phase = 0) {
   const width = settings.width;
   const height = settings.height;
-  if (gl.canvas.width !== width) gl.canvas.width = width;
-  if (gl.canvas.height !== height) gl.canvas.height = height;
-  gl.viewport(0, 0, width, height);
+  bundle.renderer.setSize(width, height, false);
+  bundle.camera.left = 0;
+  bundle.camera.right = width;
+  bundle.camera.top = 0;
+  bundle.camera.bottom = height;
+  bundle.camera.updateProjectionMatrix();
   const background = hexToRgba(settings.backgroundColor, settings.transparentBackground ? 0 : 1);
-  gl.clearColor(background[0], background[1], background[2], background[3]);
-  gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  bundle.renderer.setClearColor(new THREE.Color(background[0], background[1], background[2]), background[3]);
+  bundle.renderer.clear();
 
-  const seed = hashSeed(settings.seed);
-  drawNoiseTexture(bundle, settings, seed, phase);
-
-  const frame = buildFrameGeometry(pool, settings, phase);
-  gl.lineWidth(Math.max(1, settings.lineWidth));
-  drawVertices(bundle, bundle.line, bundle.linePosition, bundle.lineAlpha, bundle.lineResolution, bundle.lineColor, frame.lineVertices, frame.lineAlphas, gl.LINES, hexToRgba(settings.lineColor, 0.9));
-  drawVertices(bundle, bundle.line, bundle.linePosition, bundle.lineAlpha, bundle.lineResolution, bundle.lineColor, frame.stubVertices, frame.stubAlphas, gl.LINES, hexToRgba(settings.lineColor, 0.72));
-  gl.lineWidth(Math.max(1, settings.pathThickness));
-  drawVertices(bundle, bundle.line, bundle.linePosition, bundle.lineAlpha, bundle.lineResolution, bundle.lineColor, frame.pathVertices, frame.pathAlphas, gl.LINES, hexToRgba(settings.pathColor, 0.96));
-  drawVertices(bundle, bundle.point, bundle.pointPosition, bundle.pointAlpha, bundle.pointResolution, bundle.pointColor, frame.nodeVertices, frame.nodeAlphas, gl.POINTS, hexToRgba(settings.nodeColor, 1), Math.max(1.2, settings.nodeSize * 2.3));
-  drawVertices(bundle, bundle.point, bundle.pointPosition, bundle.pointAlpha, bundle.pointResolution, bundle.pointColor, frame.stubNodeVertices, frame.stubNodeAlphas, gl.POINTS, hexToRgba(settings.nodeColor, 0.88), Math.max(1, settings.nodeSize * 1.45));
+  const frame = buildFrameGeometry(pool, settings, phase, mask);
+  drawVertices(bundle, frame.lineVertices, frame.lineAlphas, 'lines', hexToRgba(settings.lineColor, 0.9));
+  drawVertices(bundle, frame.stubVertices, frame.stubAlphas, 'lines', hexToRgba(settings.lineColor, 0.72));
+  drawVertices(bundle, frame.pathVertices, frame.pathAlphas, 'lines', hexToRgba(settings.pathColor, 0.96));
+  drawVertices(bundle, frame.nodeVertices, frame.nodeAlphas, 'points', hexToRgba(settings.nodeColor, 1), Math.max(1.2, settings.nodeSize * 2.3));
+  drawVertices(bundle, frame.stubNodeVertices, frame.stubNodeAlphas, 'points', hexToRgba(settings.nodeColor, 0.88), Math.max(1, settings.nodeSize * 1.45));
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -763,7 +823,181 @@ function preferredVideoMimeType() {
   return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) ?? '';
 }
 
-async function exportLoopVideo(settings: NoiseSettings) {
+function loadImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('Could not load SVG image'));
+    image.src = src;
+  });
+}
+
+async function loadSvgText(src: string) {
+  const response = await fetch(src);
+  return response.text();
+}
+
+function imageDataToMask(context: CanvasRenderingContext2D, width: number, height: number): FieldMask {
+  return {
+    width,
+    height,
+    pixels: context.getImageData(0, 0, width, height).data,
+  };
+}
+
+async function createSvg2dMask(settings: NoiseSettings): Promise<FieldMask | null> {
+  if (settings.source !== 'svg' || !settings.svgDataUrl) return null;
+  const image = await loadImage(settings.svgDataUrl);
+  const canvas = document.createElement('canvas');
+  canvas.width = settings.width;
+  canvas.height = settings.height;
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+
+  const sourceWidth = image.naturalWidth || settings.width;
+  const sourceHeight = image.naturalHeight || settings.height;
+  const fit = Math.min(settings.width / sourceWidth, settings.height / sourceHeight) * 0.55 * settings.svgScale;
+  const drawWidth = sourceWidth * fit;
+  const drawHeight = sourceHeight * fit;
+  const centerX = settings.width * 0.5 + settings.svgPositionX * settings.width * 0.5;
+  const centerY = settings.height * 0.5 + settings.svgPositionY * settings.height * 0.5;
+
+  context.clearRect(0, 0, settings.width, settings.height);
+  context.drawImage(image, centerX - drawWidth * 0.5, centerY - drawHeight * 0.5, drawWidth, drawHeight);
+  context.globalCompositeOperation = 'source-in';
+  context.fillStyle = '#ffffff';
+  context.fillRect(0, 0, settings.width, settings.height);
+  context.globalCompositeOperation = 'destination-over';
+  context.fillStyle = '#000000';
+  context.fillRect(0, 0, settings.width, settings.height);
+  context.globalCompositeOperation = 'source-over';
+
+  return imageDataToMask(context, settings.width, settings.height);
+}
+
+function svg3dMaskKey(settings: NoiseSettings) {
+  return JSON.stringify({
+    svgDataUrl: settings.svgDataUrl,
+    width: settings.width,
+    height: settings.height,
+    scale: settings.svgScale,
+    positionX: settings.svgPositionX,
+    positionY: settings.svgPositionY,
+    extrude: settings.svgExtrude,
+  });
+}
+
+function disposeSvg3dMaskCache() {
+  if (!svg3dMaskCache) return;
+  svg3dMaskCache.group.traverse((object) => {
+    if ('geometry' in object && object.geometry instanceof THREE.BufferGeometry) object.geometry.dispose();
+  });
+  svg3dMaskCache.material.dispose();
+  svg3dMaskCache.renderer.dispose();
+  svg3dMaskCache = null;
+}
+
+async function getSvg3dMaskCache(settings: NoiseSettings): Promise<Svg3dMaskCache | null> {
+  if (!settings.svgDataUrl) return null;
+  const key = svg3dMaskKey(settings);
+  if (svg3dMaskCache?.key === key) return svg3dMaskCache;
+
+  disposeSvg3dMaskCache();
+
+  const svgText = await loadSvgText(settings.svgDataUrl);
+  const loader = new SVGLoader();
+  const svg = loader.parse(svgText);
+  const group = new THREE.Group();
+  const geometryGroup = new THREE.Group();
+  const material = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+
+  for (const path of svg.paths) {
+    const shapes = SVGLoader.createShapes(path);
+    for (const shape of shapes) {
+      const geometry = new THREE.ExtrudeGeometry(shape, {
+        depth: settings.svgExtrude * 160,
+        bevelEnabled: false,
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      geometryGroup.add(mesh);
+    }
+  }
+
+  if (!geometryGroup.children.length) {
+    material.dispose();
+    return null;
+  }
+
+  const sourceBox = new THREE.Box3().setFromObject(geometryGroup);
+  const sourceSize = sourceBox.getSize(new THREE.Vector3());
+  const sourceCenter = sourceBox.getCenter(new THREE.Vector3());
+  geometryGroup.position.sub(sourceCenter);
+  group.add(geometryGroup);
+  group.scale.y = -1;
+  const fit = Math.min(settings.width / Math.max(1, sourceSize.x), settings.height / Math.max(1, sourceSize.y)) * 0.55 * settings.svgScale;
+  group.scale.multiplyScalar(fit);
+  group.position.x += settings.svgPositionX * settings.width * 0.5;
+  group.position.y += settings.svgPositionY * settings.height * -0.5;
+
+  const canvas = document.createElement('canvas');
+  const renderer = new THREE.WebGLRenderer({ canvas, alpha: false, antialias: true, preserveDrawingBuffer: true });
+  renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+  renderer.setPixelRatio(1);
+  renderer.setSize(settings.width, settings.height, false);
+  renderer.setClearColor(0x000000, 1);
+
+  const scene = new THREE.Scene();
+  scene.add(group);
+  const camera = new THREE.PerspectiveCamera(36, settings.width / settings.height, 0.1, 10000);
+
+  const maskCanvas = document.createElement('canvas');
+  maskCanvas.width = settings.width;
+  maskCanvas.height = settings.height;
+  const maskContext = maskCanvas.getContext('2d');
+  if (!maskContext) {
+    renderer.dispose();
+    material.dispose();
+    return null;
+  }
+
+  svg3dMaskCache = {
+    key,
+    renderer,
+    scene,
+    camera,
+    group,
+    material,
+    canvas,
+    maskContext,
+  };
+
+  return svg3dMaskCache;
+}
+
+async function createSvg3dMask(settings: NoiseSettings, phase: number, orbit: SvgOrbit | null): Promise<FieldMask | null> {
+  if (settings.source !== 'svg' || settings.svgMode !== '3d' || !settings.svgDataUrl) return null;
+  const cache = await getSvg3dMaskCache(settings);
+  if (!cache) return null;
+
+  const target = orbit?.target.clone() ?? new THREE.Vector3(0, 0, 0);
+  cache.camera.aspect = settings.width / settings.height;
+  cache.camera.updateProjectionMatrix();
+  cache.camera.position.copy(orbit?.position ?? new THREE.Vector3(0, 0, Math.max(settings.width, settings.height) * 1.6));
+  cache.camera.lookAt(target);
+  cache.group.rotation.y = settings.motionEnabled && settings.svgAnimate ? phase * Math.PI * 2 : 0;
+  cache.renderer.render(cache.scene, cache.camera);
+
+  cache.maskContext.clearRect(0, 0, settings.width, settings.height);
+  cache.maskContext.drawImage(cache.canvas, 0, 0);
+  return imageDataToMask(cache.maskContext, settings.width, settings.height);
+}
+
+async function createSvgMask(settings: NoiseSettings, phase = 0, orbit: SvgOrbit | null = null): Promise<FieldMask | null> {
+  if (settings.svgMode === '3d') return createSvg3dMask(settings, phase, orbit);
+  return createSvg2dMask(settings);
+}
+
+async function exportLoopVideo(settings: NoiseSettings, orbit: SvgOrbit | null) {
   if (!('MediaRecorder' in window)) {
     globalThis.alert('Video export is not supported in this browser.');
     return;
@@ -776,13 +1010,14 @@ async function exportLoopVideo(settings: NoiseSettings) {
     return;
   }
 
-  const pool = buildPatternPool(settings);
+  const exportOrbit = cloneOrbit(orbit);
+  const mask = await createSvgMask(settings, 0, exportOrbit);
+  const pool = buildPatternPool(settings, mask);
   const fps = Math.max(6, Math.min(30, Math.round(settings.frameRate)));
   const duration = Math.max(2, settings.loopDuration);
-  const frameCount = Math.ceil(duration * fps);
   const mimeType = preferredVideoMimeType();
   const extension = mimeType.includes('mp4') ? 'mp4' : 'webm';
-  renderWebgl(bundle, pool, settings, 0);
+  renderWebgl(bundle, pool, settings, mask, 0);
   const stream = canvas.captureStream(fps);
   const track = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined;
   const chunks: BlobPart[] = [];
@@ -796,34 +1031,216 @@ async function exportLoopVideo(settings: NoiseSettings) {
   });
 
   recorder.start();
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    renderWebgl(bundle, pool, settings, frame / frameCount);
-    track?.requestFrame?.();
-    await new Promise((resolve) => window.setTimeout(resolve, 1000 / fps));
-  }
+  track?.requestFrame?.();
+
+  await new Promise<void>((resolve) => {
+    const startedAt = performance.now();
+    let lastFrameAt = 0;
+    let rendering = false;
+
+    const renderFrame = async (phase: number) => {
+      if (settings.source === 'svg' && settings.svgMode === '3d' && settings.svgAnimate) {
+        const frameMask = await createSvgMask(settings, phase, exportOrbit);
+        const framePool = buildPatternPool(settings, frameMask);
+        renderWebgl(bundle, framePool, settings, frameMask, phase);
+      } else {
+        renderWebgl(bundle, pool, settings, mask, phase);
+      }
+      track?.requestFrame?.();
+    };
+
+    const tick = (now: number) => {
+      const elapsed = now - startedAt;
+      const frameInterval = 1000 / fps;
+      if (!rendering && (elapsed - lastFrameAt >= frameInterval || lastFrameAt === 0)) {
+        lastFrameAt = elapsed;
+        rendering = true;
+        const phase = Math.min(0.999999, elapsed / (duration * 1000));
+        void renderFrame(phase).finally(() => {
+          rendering = false;
+          if (performance.now() - startedAt >= duration * 1000) {
+            resolve();
+          }
+        });
+      }
+
+      if (elapsed < duration * 1000) {
+        window.requestAnimationFrame(tick);
+      } else if (!rendering) {
+        resolve();
+      }
+    };
+
+    window.requestAnimationFrame(tick);
+  });
+
   recorder.stop();
   await stopped;
   stream.getTracks().forEach((streamTrack) => streamTrack.stop());
+  bundle.lineMaterial.dispose();
+  bundle.pointMaterial.dispose();
+  bundle.renderer.dispose();
 
   const blob = new Blob(chunks, { type: mimeType || 'video/webm' });
   downloadBlob(blob, `truecourse-pattern-${settings.seed.replace(/[^a-z0-9-]/gi, '-')}.${extension}`);
 }
 
 export function NoiseCanvas({ settings }: { settings: NoiseSettings }) {
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const glRef = useRef<GlBundle | null>(null);
+  const orbitRef = useRef<SvgOrbit | null>(null);
   const lastVideoNonceRef = useRef(settings.videoExportNonce);
+  const [svgMask, setSvgMask] = useState<FieldMask | null>(null);
+  const [orbitRevision, setOrbitRevision] = useState(0);
+  const [previewSize, setPreviewSize] = useState<PreviewSize | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     glRef.current = createGlBundle(canvas);
+
+    return () => {
+      glRef.current?.lineMaterial.dispose();
+      glRef.current?.pointMaterial.dispose();
+      glRef.current?.renderer.dispose();
+      disposeSvg3dMaskCache();
+      glRef.current = null;
+    };
   }, []);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+
+    const updatePreviewSize = () => {
+      const bounds = stage.getBoundingClientRect();
+      const width = Math.max(1, settings.width);
+      const height = Math.max(1, settings.height);
+      const targetAspect = width / height;
+      const containerAspect = bounds.width / Math.max(1, bounds.height);
+      const nextSize = containerAspect > targetAspect
+        ? {
+            width: bounds.height * targetAspect,
+            height: bounds.height,
+          }
+        : {
+            width: bounds.width,
+            height: bounds.width / targetAspect,
+          };
+
+      setPreviewSize((current) => {
+        const nextWidth = Math.round(nextSize.width);
+        const nextHeight = Math.round(nextSize.height);
+        if (current?.width === nextWidth && current.height === nextHeight) return current;
+        return { width: nextWidth, height: nextHeight };
+      });
+    };
+
+    updatePreviewSize();
+    const observer = new ResizeObserver(updatePreviewSize);
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, [settings.height, settings.width]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || settings.source !== 'svg' || settings.svgMode !== '3d') return undefined;
+
+    const camera = new THREE.PerspectiveCamera(36, settings.width / settings.height, 0.1, 10000);
+    camera.position.copy(orbitRef.current?.position ?? new THREE.Vector3(0, 0, Math.max(settings.width, settings.height) * 1.6));
+    const target = orbitRef.current?.target.clone() ?? new THREE.Vector3(0, 0, 0);
+    camera.lookAt(target);
+
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = false;
+    controls.enablePan = true;
+    controls.screenSpacePanning = true;
+    controls.target.copy(target);
+    controls.update();
+
+    const updateOrbit = () => {
+      orbitRef.current = {
+        position: camera.position.clone(),
+        target: controls.target.clone(),
+      };
+      setOrbitRevision((value) => value + 1);
+    };
+    updateOrbit();
+    controls.addEventListener('change', updateOrbit);
+
+    return () => {
+      controls.removeEventListener('change', updateOrbit);
+      controls.dispose();
+    };
+  }, [settings.height, settings.source, settings.svgMode, settings.width]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (settings.source !== 'svg' || !settings.svgDataUrl) {
+      disposeSvg3dMaskCache();
+      setSvgMask(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    if (settings.svgMode !== '3d') disposeSvg3dMaskCache();
+
+    void createSvgMask(settings, 0, orbitRef.current).then((mask) => {
+      if (!cancelled) setSvgMask(mask);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [orbitRevision, settings]);
 
   useEffect(() => {
     const bundle = glRef.current;
     if (!bundle) return;
-    const pool = buildPatternPool(settings);
+    const overlayCanvas = overlayRef.current;
+    const animatedSvg3d = settings.source === 'svg' && settings.svgMode === '3d' && settings.motionEnabled && settings.svgAnimate;
+    let cancelled = false;
+    let renderingDynamicMask = false;
+
+    if (animatedSvg3d) {
+      let animationId = 0;
+      let lastFrameAt = 0;
+
+      const renderPhase = async (phase: number) => {
+        if (renderingDynamicMask) return;
+        renderingDynamicMask = true;
+        const mask = await createSvgMask(settings, phase, orbitRef.current);
+        if (!cancelled) {
+          const pool = buildPatternPool(settings, mask);
+          renderWebgl(bundle, pool, settings, mask, phase);
+          drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), phase, mask);
+        }
+        renderingDynamicMask = false;
+      };
+
+      const tick = (now: number) => {
+        const frameInterval = 1000 / Math.max(1, settings.frameRate);
+        if (now - lastFrameAt >= frameInterval) {
+          lastFrameAt = now;
+          const phase = ((now / 1000) % settings.loopDuration) / settings.loopDuration;
+          void renderPhase(phase);
+        }
+        animationId = window.requestAnimationFrame(tick);
+      };
+
+      void renderPhase(0);
+      animationId = window.requestAnimationFrame(tick);
+
+      return () => {
+        cancelled = true;
+        window.cancelAnimationFrame(animationId);
+        drawNoiseMapOverlay(overlayCanvas, { ...settings, showMap: false }, hashSeed(settings.seed), 0, svgMask);
+      };
+    }
+
+    const pool = buildPatternPool(settings, svgMask);
     let animationId = 0;
     let lastFrameAt = 0;
 
@@ -832,26 +1249,38 @@ export function NoiseCanvas({ settings }: { settings: NoiseSettings }) {
       if (now - lastFrameAt >= frameInterval) {
         lastFrameAt = now;
         const phase = ((now / 1000) % settings.loopDuration) / settings.loopDuration;
-        renderWebgl(bundle, pool, settings, phase);
+        renderWebgl(bundle, pool, settings, svgMask, phase);
+        drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), phase, svgMask);
       }
       animationId = window.requestAnimationFrame(tick);
     };
 
-    renderWebgl(bundle, pool, settings, 0);
+    renderWebgl(bundle, pool, settings, svgMask, 0);
+    drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), 0, svgMask);
     if (settings.motionEnabled) animationId = window.requestAnimationFrame(tick);
 
-    return () => window.cancelAnimationFrame(animationId);
-  }, [settings]);
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(animationId);
+      drawNoiseMapOverlay(overlayCanvas, { ...settings, showMap: false }, hashSeed(settings.seed), 0, svgMask);
+    };
+  }, [settings, svgMask]);
 
   useEffect(() => {
     if (settings.videoExportNonce === lastVideoNonceRef.current) return;
     lastVideoNonceRef.current = settings.videoExportNonce;
-    void exportLoopVideo(settings);
+    void exportLoopVideo(settings, cloneOrbit(orbitRef.current));
   }, [settings]);
 
   return (
-    <div className="preview-stage">
-      <canvas ref={canvasRef} className="pattern-canvas lab-canvas noise-canvas" aria-label="Weighted network preview" />
+    <div ref={stageRef} className="preview-stage">
+      <div
+        className="preview-frame"
+        style={previewSize ? { width: `${previewSize.width}px`, height: `${previewSize.height}px` } : undefined}
+      >
+        <canvas ref={canvasRef} className="pattern-canvas lab-canvas noise-canvas" aria-label="Weighted network preview" />
+        <canvas ref={overlayRef} className="noise-map-canvas" aria-hidden="true" hidden />
+      </div>
     </div>
   );
 }

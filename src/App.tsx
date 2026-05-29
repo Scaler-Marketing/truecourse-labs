@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { DialRoot, useDialKit, type DialConfig } from 'dialkit';
 import 'dialkit/styles.css';
 import './App.css';
@@ -8,6 +8,8 @@ import { NoiseCanvas, type NoiseSettings } from './components/NoiseCanvas';
 const defaultSeed = 'TC-48291';
 
 type ShaderMode = 'bindings' | 'blobs';
+type BindingsSource = 'noise' | 'svg';
+type SvgMode = '2d' | '3d';
 type LabSettings =
   | { mode: 'bindings'; values: NoiseSettings }
   | { mode: 'blobs'; values: BlobsSettings };
@@ -21,6 +23,8 @@ type LabControls = {
     seed: string;
   };
   Bindings?: {
+    source: string;
+    loadSvg: boolean;
     size: number;
     complexity: number;
     contrast: number;
@@ -35,6 +39,19 @@ type LabControls = {
     backgroundColor: string;
     lineColor: string;
     nodeColor: string;
+  };
+  SVG?: {
+    mode: string;
+    noise: boolean;
+    size: number;
+    complexity: number;
+    contrast: number;
+    brightness: number;
+    positionX: number;
+    positionY: number;
+    scale: number;
+    extrude: number;
+    animate: boolean;
   };
   Blobs?: {
     lineCount: number;
@@ -74,11 +91,19 @@ function isShaderMode(value: string): value is ShaderMode {
   return value === 'bindings' || value === 'blobs';
 }
 
+function isBindingsSource(value: string): value is BindingsSource {
+  return value === 'noise' || value === 'svg';
+}
+
 function slider(defaultValue: number, min: number, max: number, step: number): [number, number, number, number] {
   return [defaultValue, min, max, step];
 }
 
-function createDialConfig(shaderMode: ShaderMode): DialConfig {
+function isSvgMode(value: string): value is SvgMode {
+  return value === '2d' || value === '3d';
+}
+
+function createDialConfig(shaderMode: ShaderMode, bindingsSource: BindingsSource, svgNoiseEnabled: boolean, svgMode: SvgMode): DialConfig {
   return {
     refresh: { type: 'action', label: 'Refresh' },
     randomize: { type: 'action', label: 'Randomize Seed' },
@@ -97,10 +122,24 @@ function createDialConfig(shaderMode: ShaderMode): DialConfig {
     ...(shaderMode === 'bindings'
       ? {
           Bindings: {
-            size: slider(0.42, 0.05, 1, 0.01),
-            complexity: slider(0.5, 0, 1, 0.01),
-            contrast: slider(0.58, 0, 1, 0.01),
-            brightness: slider(0.48, 0, 1, 0.01),
+            source: {
+              type: 'select',
+              default: bindingsSource,
+              options: [
+                { value: 'noise', label: 'Noise' },
+                { value: 'svg', label: 'SVG' },
+              ],
+            },
+            ...(bindingsSource === 'svg'
+              ? {
+                  loadSvg: { type: 'action', label: 'Load SVG' },
+                }
+              : {
+                  size: slider(0.42, 0.05, 1, 0.01),
+                  complexity: slider(0.5, 0, 1, 0.01),
+                  contrast: slider(0.58, 0, 1, 0.01),
+                  brightness: slider(0.48, 0, 1, 0.01),
+                }),
             showMap: false,
             nodeDensity: slider(0.64, 0.05, 1, 0.01),
             connectionDensity: slider(0.74, 0, 1, 0.01),
@@ -112,6 +151,38 @@ function createDialConfig(shaderMode: ShaderMode): DialConfig {
             lineColor: '#7DB2FF',
             nodeColor: '#D9EAFF',
           },
+          ...(bindingsSource === 'svg'
+            ? {
+                SVG: {
+                  mode: {
+                    type: 'select',
+                    default: svgMode,
+                    options: [
+                      { value: '2d', label: '2D' },
+                      { value: '3d', label: '3D' },
+                    ],
+                  },
+                  noise: false,
+                  ...(svgNoiseEnabled
+                    ? {
+                        size: slider(0.42, 0.05, 1, 0.01),
+                        complexity: slider(0.5, 0, 1, 0.01),
+                        contrast: slider(0.58, 0, 1, 0.01),
+                        brightness: slider(0.48, 0, 1, 0.01),
+                      }
+                    : {}),
+                  positionX: slider(0, -1, 1, 0.01),
+                  positionY: slider(0, -1, 1, 0.01),
+                  scale: slider(1, 0.1, 2.5, 0.01),
+                  ...(svgMode === '3d'
+                    ? {
+                        extrude: slider(0.22, 0.02, 1.2, 0.01),
+                        animate: true,
+                      }
+                    : {}),
+                },
+              }
+            : {}),
           Path: {
             enabled: true,
             thickness: slider(1.35, 0.4, 8, 0.1),
@@ -161,18 +232,29 @@ function createBindingsSettings(
   controls: LabControls,
   seed: string,
   videoExportNonce: number,
+  svgDataUrl: string | null,
 ): NoiseSettings {
   const bindings = controls.Bindings;
+  const svg = controls.SVG;
   const path = controls.Path;
   const motion = controls.Motion;
   const exportControls = controls.Export;
 
   return {
     seed,
-    size: bindings?.size ?? 0.42,
-    complexity: bindings?.complexity ?? 0.5,
-    contrast: bindings?.contrast ?? 0.58,
-    brightness: bindings?.brightness ?? 0.48,
+    source: bindings?.source === 'svg' ? 'svg' : 'noise',
+    svgDataUrl,
+    svgMode: svg?.mode === '3d' ? '3d' : '2d',
+    svgNoiseEnabled: svg?.noise ?? false,
+    svgPositionX: svg?.positionX ?? 0,
+    svgPositionY: svg?.positionY ?? 0,
+    svgScale: svg?.scale ?? 1,
+    svgExtrude: svg?.extrude ?? 0.22,
+    svgAnimate: svg?.animate ?? true,
+    size: bindings?.size ?? svg?.size ?? 0.42,
+    complexity: bindings?.complexity ?? svg?.complexity ?? 0.5,
+    contrast: bindings?.contrast ?? svg?.contrast ?? 0.58,
+    brightness: bindings?.brightness ?? svg?.brightness ?? 0.48,
     showMap: bindings?.showMap ?? false,
     nodeDensity: bindings?.nodeDensity ?? 0.64,
     connectionDensity: bindings?.connectionDensity ?? 0.74,
@@ -229,11 +311,16 @@ function createBlobsSettings(
 
 function Lab() {
   const [shaderMode, setShaderMode] = useState<ShaderMode>('bindings');
+  const [bindingsSource, setBindingsSource] = useState<BindingsSource>('noise');
+  const [svgNoiseEnabled, setSvgNoiseEnabled] = useState(false);
+  const [svgMode, setSvgMode] = useState<SvgMode>('2d');
+  const svgInputRef = useRef<HTMLInputElement | null>(null);
+  const [svgDataUrl, setSvgDataUrl] = useState<string | null>(null);
   const [seedOverride, setSeedOverride] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
   const [pendingExport, setPendingExport] = useState(false);
   const [videoExportNonce, setVideoExportNonce] = useState(0);
-  const config = useMemo(() => createDialConfig(shaderMode), [shaderMode]);
+  const config = useMemo(() => createDialConfig(shaderMode, bindingsSource, svgNoiseEnabled, svgMode), [bindingsSource, shaderMode, svgMode, svgNoiseEnabled]);
 
   const controls = useDialKit(
     'Noise Field',
@@ -246,6 +333,7 @@ function Lab() {
           setNonce((value) => value + 1);
         }
         if (action === 'reset') window.location.reload();
+        if (action === 'Bindings.loadSvg' || action === 'loadSvg') svgInputRef.current?.click();
         if (action === 'Export.exportPng' || action === 'exportPng') setPendingExport(true);
         if (action === 'Export.exportMp4' || action === 'exportMp4') setVideoExportNonce((value) => value + 1);
       },
@@ -259,12 +347,31 @@ function Lab() {
     }
   }, [controls.Shader.mode, shaderMode]);
 
+  useEffect(() => {
+    const nextSource = controls.Bindings?.source;
+    if (nextSource && isBindingsSource(nextSource) && nextSource !== bindingsSource) {
+      setBindingsSource(nextSource);
+    }
+  }, [bindingsSource, controls.Bindings?.source]);
+
+  useEffect(() => {
+    const nextSvgNoise = controls.SVG?.noise ?? false;
+    if (nextSvgNoise !== svgNoiseEnabled) setSvgNoiseEnabled(nextSvgNoise);
+  }, [controls.SVG?.noise, svgNoiseEnabled]);
+
+  useEffect(() => {
+    const nextSvgMode = controls.SVG?.mode;
+    if (nextSvgMode && isSvgMode(nextSvgMode) && nextSvgMode !== svgMode) {
+      setSvgMode(nextSvgMode);
+    }
+  }, [controls.SVG?.mode, svgMode]);
+
   const settings: LabSettings = useMemo(() => {
     const seed = `${seedOverride ?? controls.Shader.seed}:${nonce}`;
     return shaderMode === 'blobs'
       ? { mode: 'blobs', values: createBlobsSettings(controls, seed, videoExportNonce) }
-      : { mode: 'bindings', values: createBindingsSettings(controls, seed, videoExportNonce) };
-  }, [controls, nonce, seedOverride, shaderMode, videoExportNonce]);
+      : { mode: 'bindings', values: createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl) };
+  }, [controls, nonce, seedOverride, shaderMode, svgDataUrl, videoExportNonce]);
 
   const debouncedSettings = useDebouncedValue(settings, 35);
 
@@ -281,6 +388,22 @@ function Lab() {
 
   return (
     <main className="app-shell">
+      <input
+        ref={svgInputRef}
+        className="file-input"
+        type="file"
+        accept=".svg,image/svg+xml"
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = '';
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = () => {
+            if (typeof reader.result === 'string') setSvgDataUrl(reader.result);
+          };
+          reader.readAsDataURL(file);
+        }}
+      />
       <section className="work-area">
         {debouncedSettings.mode === 'blobs'
           ? <BlobsCanvas settings={debouncedSettings.values} />
