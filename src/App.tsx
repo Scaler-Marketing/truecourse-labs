@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { DialRoot, useDialKit, type DialConfig } from 'dialkit';
+import { DialRoot, DialStore, useDialKit, type DialConfig } from 'dialkit';
 import 'dialkit/styles.css';
 import './App.css';
 import { BlobsCanvas, type BlobsSettings } from './components/BlobsCanvas';
@@ -8,7 +8,7 @@ import { NoiseCanvas, type NoiseSettings } from './components/NoiseCanvas';
 const defaultSeed = 'TC-48291';
 
 type ShaderMode = 'bindings' | 'blobs';
-type BindingsSource = 'noise' | 'svg';
+type BindingsSource = 'noise' | 'svg' | 'video';
 type SvgMode = '2d' | '3d';
 type LabSettings =
   | { mode: 'bindings'; values: NoiseSettings }
@@ -24,11 +24,17 @@ type LabControls = {
   };
   Bindings?: {
     source: string;
-    loadSvg: boolean;
+    loadSvg?: boolean;
+    loadVideo?: boolean;
     size: number;
     complexity: number;
     contrast: number;
     brightness: number;
+    videoThreshold?: number;
+    videoInvert?: boolean;
+    videoPositionX?: number;
+    videoPositionY?: number;
+    videoScale?: number;
     showMap: boolean;
     nodeDensity: number;
     connectionDensity: number;
@@ -70,7 +76,7 @@ type LabControls = {
   };
   Motion: {
     enabled: boolean;
-    loopDuration: number;
+    loopDuration?: number;
     amount: number;
     frameRate: number;
   };
@@ -92,7 +98,7 @@ function isShaderMode(value: string): value is ShaderMode {
 }
 
 function isBindingsSource(value: string): value is BindingsSource {
-  return value === 'noise' || value === 'svg';
+  return value === 'noise' || value === 'svg' || value === 'video';
 }
 
 function slider(defaultValue: number, min: number, max: number, step: number): [number, number, number, number] {
@@ -103,7 +109,17 @@ function isSvgMode(value: string): value is SvgMode {
   return value === '2d' || value === '3d';
 }
 
-function createDialConfig(shaderMode: ShaderMode, bindingsSource: BindingsSource, svgNoiseEnabled: boolean, svgMode: SvgMode): DialConfig {
+function createDialConfig(
+  shaderMode: ShaderMode,
+  bindingsSource: BindingsSource,
+  svgNoiseEnabled: boolean,
+  svgMode: SvgMode,
+  videoDuration: number | null,
+): DialConfig {
+  const effectiveLoopDuration = bindingsSource === 'video'
+    ? Math.max(0.25, videoDuration ?? 8)
+    : 8;
+
   return {
     refresh: { type: 'action', label: 'Refresh' },
     randomize: { type: 'action', label: 'Randomize Seed' },
@@ -128,18 +144,28 @@ function createDialConfig(shaderMode: ShaderMode, bindingsSource: BindingsSource
               options: [
                 { value: 'noise', label: 'Noise' },
                 { value: 'svg', label: 'SVG' },
+                { value: 'video', label: 'Video' },
               ],
             },
             ...(bindingsSource === 'svg'
               ? {
                   loadSvg: { type: 'action', label: 'Load SVG' },
                 }
-              : {
-                  size: slider(0.42, 0.05, 1, 0.01),
-                  complexity: slider(0.5, 0, 1, 0.01),
-                  contrast: slider(0.58, 0, 1, 0.01),
-                  brightness: slider(0.48, 0, 1, 0.01),
-                }),
+              : {}),
+            ...(bindingsSource === 'video'
+              ? {
+                  loadVideo: { type: 'action', label: 'Load Video' },
+                }
+              : {}),
+            size: slider(0.42, 0.05, 1, 0.01),
+            complexity: slider(0.5, 0, 1, 0.01),
+            contrast: slider(0.58, 0, 1, 0.01),
+            brightness: slider(0.48, 0, 1, 0.01),
+            videoThreshold: slider(0.5, 0, 1, 0.01),
+            videoInvert: false,
+            videoPositionX: slider(0, -1, 1, 0.01),
+            videoPositionY: slider(0, -1, 1, 0.01),
+            videoScale: slider(1, 0.1, 2.5, 0.01),
             showMap: false,
             nodeDensity: slider(0.64, 0.05, 1, 0.01),
             connectionDensity: slider(0.74, 0, 1, 0.01),
@@ -203,7 +229,9 @@ function createDialConfig(shaderMode: ShaderMode, bindingsSource: BindingsSource
         }),
     Motion: {
       enabled: false,
-      loopDuration: slider(8, 2, 30, 0.5),
+      loopDuration: bindingsSource === 'video'
+        ? slider(effectiveLoopDuration, 0.25, Math.max(0.5, effectiveLoopDuration), 0.01)
+        : slider(8, 2, 30, 0.5),
       amount: slider(0.38, 0, 1, 0.01),
       frameRate: slider(30, 6, 30, 1),
     },
@@ -228,11 +256,34 @@ function useDebouncedValue<T>(value: T, delay: number) {
   return debounced;
 }
 
+function readVideoDuration(src: string) {
+  return new Promise<number | null>((resolve) => {
+    const video = document.createElement('video');
+    const cleanup = () => {
+      video.removeAttribute('src');
+      video.load();
+    };
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => {
+      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : null;
+      cleanup();
+      resolve(duration);
+    };
+    video.onerror = () => {
+      cleanup();
+      resolve(null);
+    };
+    video.src = src;
+  });
+}
+
 function createBindingsSettings(
   controls: LabControls,
   seed: string,
   videoExportNonce: number,
   svgDataUrl: string | null,
+  videoDataUrl: string | null,
+  videoDuration: number | null,
 ): NoiseSettings {
   const bindings = controls.Bindings;
   const svg = controls.SVG;
@@ -242,7 +293,7 @@ function createBindingsSettings(
 
   return {
     seed,
-    source: bindings?.source === 'svg' ? 'svg' : 'noise',
+    source: bindings?.source === 'svg' ? 'svg' : bindings?.source === 'video' ? 'video' : 'noise',
     svgDataUrl,
     svgMode: svg?.mode === '3d' ? '3d' : '2d',
     svgNoiseEnabled: svg?.noise ?? false,
@@ -251,6 +302,12 @@ function createBindingsSettings(
     svgScale: svg?.scale ?? 1,
     svgExtrude: svg?.extrude ?? 0.22,
     svgAnimate: svg?.animate ?? true,
+    videoDataUrl,
+    videoThreshold: bindings?.videoThreshold ?? 0.5,
+    videoInvert: bindings?.videoInvert ?? false,
+    videoPositionX: bindings?.videoPositionX ?? 0,
+    videoPositionY: bindings?.videoPositionY ?? 0,
+    videoScale: bindings?.videoScale ?? 1,
     size: bindings?.size ?? svg?.size ?? 0.42,
     complexity: bindings?.complexity ?? svg?.complexity ?? 0.5,
     contrast: bindings?.contrast ?? svg?.contrast ?? 0.58,
@@ -270,7 +327,9 @@ function createBindingsSettings(
     pathEndpointSpread: path?.endpointSpread ?? 0.72,
     pathColor: path?.color ?? '#FFFFFF',
     motionEnabled: motion.enabled,
-    loopDuration: motion.loopDuration,
+    loopDuration: bindings?.source === 'video'
+      ? Math.max(0.25, videoDuration ?? motion.loopDuration ?? 8)
+      : motion.loopDuration ?? 8,
     motionAmount: motion.amount,
     frameRate: Math.round(motion.frameRate),
     transparentBackground: exportControls.transparentBackground,
@@ -299,7 +358,7 @@ function createBlobsSettings(
     backgroundColor: blobs?.backgroundColor ?? '#79BAEF',
     blobColor: blobs?.blobColor ?? '#74DCEB',
     motionEnabled: motion.enabled,
-    loopDuration: motion.loopDuration,
+    loopDuration: motion.loopDuration ?? 8,
     motionAmount: motion.amount,
     frameRate: Math.round(motion.frameRate),
     transparentBackground: exportControls.transparentBackground,
@@ -315,15 +374,25 @@ function Lab() {
   const [svgNoiseEnabled, setSvgNoiseEnabled] = useState(false);
   const [svgMode, setSvgMode] = useState<SvgMode>('2d');
   const svgInputRef = useRef<HTMLInputElement | null>(null);
+  const videoInputRef = useRef<HTMLInputElement | null>(null);
   const [svgDataUrl, setSvgDataUrl] = useState<string | null>(null);
+  const [videoDataUrl, setVideoDataUrl] = useState<string | null>(null);
+  const [videoDuration, setVideoDuration] = useState<number | null>(null);
   const [seedOverride, setSeedOverride] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
   const [pendingExport, setPendingExport] = useState(false);
   const [videoExportNonce, setVideoExportNonce] = useState(0);
-  const config = useMemo(() => createDialConfig(shaderMode, bindingsSource, svgNoiseEnabled, svgMode), [bindingsSource, shaderMode, svgMode, svgNoiseEnabled]);
+  const config = useMemo(
+    () => createDialConfig(shaderMode, bindingsSource, svgNoiseEnabled, svgMode, videoDuration),
+    [bindingsSource, shaderMode, svgMode, svgNoiseEnabled, videoDuration],
+  );
+  const panelName = useMemo(() => {
+    if (shaderMode === 'bindings') return `Noise Field / ${bindingsSource}${bindingsSource === 'video' ? ` / ${videoDuration ?? 'pending'}` : ''}`;
+    return 'Noise Field / blobs';
+  }, [bindingsSource, shaderMode, videoDuration]);
 
   const controls = useDialKit(
-    'Noise Field',
+    panelName,
     config,
     {
       onAction: (action) => {
@@ -334,6 +403,7 @@ function Lab() {
         }
         if (action === 'reset') window.location.reload();
         if (action === 'Bindings.loadSvg' || action === 'loadSvg') svgInputRef.current?.click();
+        if (action === 'Bindings.loadVideo' || action === 'loadVideo') videoInputRef.current?.click();
         if (action === 'Export.exportPng' || action === 'exportPng') setPendingExport(true);
         if (action === 'Export.exportMp4' || action === 'exportMp4') setVideoExportNonce((value) => value + 1);
       },
@@ -366,12 +436,39 @@ function Lab() {
     }
   }, [controls.SVG?.mode, svgMode]);
 
+  useEffect(() => {
+    if (bindingsSource !== 'video' || !videoDuration) return;
+    const panel = DialStore.getPanels().find((item) => item.name === panelName);
+    if (!panel) return;
+    DialStore.updateValue(panel.id, 'Motion.loopDuration', Number(videoDuration.toFixed(2)));
+  }, [bindingsSource, panelName, videoDuration]);
+
+  useEffect(() => {
+    const controlsRoot = document.querySelector<HTMLElement>('.control-rail');
+    if (!controlsRoot) return;
+    const labels = Array.from(controlsRoot.querySelectorAll<HTMLElement>('.dialkit-slider-label'));
+    const loopLabel = labels.find((label) => label.textContent?.trim().startsWith('Loop Duration'));
+    const wrapper = loopLabel?.closest<HTMLElement>('.dialkit-slider-wrapper');
+    if (!wrapper) return;
+
+    if (bindingsSource === 'video') {
+      wrapper.style.pointerEvents = 'none';
+      wrapper.style.opacity = '0.48';
+      wrapper.title = 'Video mode uses the uploaded video duration.';
+      return;
+    }
+
+    wrapper.style.pointerEvents = '';
+    wrapper.style.opacity = '';
+    wrapper.removeAttribute('title');
+  }, [bindingsSource, panelName, videoDuration]);
+
   const settings: LabSettings = useMemo(() => {
     const seed = `${seedOverride ?? controls.Shader.seed}:${nonce}`;
     return shaderMode === 'blobs'
       ? { mode: 'blobs', values: createBlobsSettings(controls, seed, videoExportNonce) }
-      : { mode: 'bindings', values: createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl) };
-  }, [controls, nonce, seedOverride, shaderMode, svgDataUrl, videoExportNonce]);
+      : { mode: 'bindings', values: createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, videoDuration) };
+  }, [controls, nonce, seedOverride, shaderMode, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
 
   const debouncedSettings = useDebouncedValue(settings, 35);
 
@@ -400,6 +497,25 @@ function Lab() {
           const reader = new FileReader();
           reader.onload = () => {
             if (typeof reader.result === 'string') setSvgDataUrl(reader.result);
+          };
+          reader.readAsDataURL(file);
+        }}
+      />
+      <input
+        ref={videoInputRef}
+        className="file-input"
+        type="file"
+        accept="video/mp4,video/webm,video/quicktime,video/*"
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = '';
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = () => {
+            if (typeof reader.result !== 'string') return;
+            setVideoDataUrl(reader.result);
+            setVideoDuration(null);
+            void readVideoDuration(reader.result).then(setVideoDuration);
           };
           reader.readAsDataURL(file);
         }}
