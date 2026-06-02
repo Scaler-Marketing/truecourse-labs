@@ -194,10 +194,14 @@ function sampleMask(mask: FieldMask | null, x: number, y: number) {
   return mask.pixels[(py * mask.width + px) * 4] / 255;
 }
 
+function shouldUseNoiseInsideSvg(settings: NoiseSettings) {
+  return settings.svgNoiseEnabled || (settings.motionEnabled && settings.svgMode === '2d');
+}
+
 function sampleSourceField(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null, phase = 0) {
   if (settings.source === 'svg') {
     const maskValue = sampleMask(mask, x, y);
-    if (!settings.svgNoiseEnabled) return maskValue;
+    if (!shouldUseNoiseInsideSvg(settings)) return maskValue;
     return maskValue * sampleNoise(seed, x, y, settings, phase);
   }
   return sampleNoise(seed, x, y, settings, phase);
@@ -206,7 +210,7 @@ function sampleSourceField(seed: number, x: number, y: number, settings: NoiseSe
 function sampleSourceBaseField(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null) {
   if (settings.source === 'svg') {
     const maskValue = sampleMask(mask, x, y);
-    if (!settings.svgNoiseEnabled) return maskValue;
+    if (!shouldUseNoiseInsideSvg(settings)) return maskValue;
     return maskValue * sampleNoiseField(seed, x, y, settings);
   }
   return sampleNoiseField(seed, x, y, settings);
@@ -227,7 +231,7 @@ function sampleNoise(seed: number, x: number, y: number, settings: NoiseSettings
 }
 
 function buildMorphWeights(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null) {
-  if (settings.source === 'svg' && !settings.svgNoiseEnabled) {
+  if (settings.source === 'svg' && !shouldUseNoiseInsideSvg(settings)) {
     const value = sampleSourceBaseField(seed, x, y, settings, mask);
     return [value, value, value, value] as [number, number, number, number];
   }
@@ -464,6 +468,7 @@ function createGlBundle(canvas: HTMLCanvasElement): GlBundle | null {
     transparent: true,
     depthTest: false,
     depthWrite: false,
+    side: THREE.DoubleSide,
     uniforms: {
       u_color: { value: new THREE.Vector4(1, 1, 1, 1) },
     },
@@ -531,29 +536,71 @@ function drawVertices(
   alphas: number[],
   mode: 'lines' | 'points',
   color: readonly number[],
-  pointSize?: number,
+  size?: number,
 ) {
   if (!vertices.length) return;
-  const positions = new Float32Array((vertices.length / 2) * 3);
-  for (let i = 0, j = 0; i < vertices.length; i += 2, j += 3) {
-    positions[j] = vertices[i];
-    positions[j + 1] = vertices[i + 1];
-    positions[j + 2] = 0;
-  }
 
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('a_alpha', new THREE.BufferAttribute(new Float32Array(alphas), 1));
+  let object: THREE.LineSegments | THREE.Mesh | THREE.Points;
+
+  if (mode === 'lines') {
+    const strokeWidth = Math.max(0.1, size ?? 1);
+    const halfWidth = strokeWidth * 0.5;
+    const positions: number[] = [];
+    const strokeAlphas: number[] = [];
+    const indices: number[] = [];
+
+    for (let i = 0, alphaIndex = 0; i < vertices.length; i += 4, alphaIndex += 2) {
+      const ax = vertices[i];
+      const ay = vertices[i + 1];
+      const bx = vertices[i + 2];
+      const by = vertices[i + 3];
+      const dx = bx - ax;
+      const dy = by - ay;
+      const length = Math.hypot(dx, dy);
+      if (length < 0.001) continue;
+
+      const nx = (-dy / length) * halfWidth;
+      const ny = (dx / length) * halfWidth;
+      const base = positions.length / 3;
+      positions.push(
+        ax + nx, ay + ny, 0,
+        ax - nx, ay - ny, 0,
+        bx + nx, by + ny, 0,
+        bx - nx, by - ny, 0,
+      );
+      strokeAlphas.push(
+        alphas[alphaIndex] ?? 1,
+        alphas[alphaIndex] ?? 1,
+        alphas[alphaIndex + 1] ?? alphas[alphaIndex] ?? 1,
+        alphas[alphaIndex + 1] ?? alphas[alphaIndex] ?? 1,
+      );
+      indices.push(base, base + 1, base + 2, base + 2, base + 1, base + 3);
+    }
+
+    if (!positions.length) return;
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geometry.setAttribute('a_alpha', new THREE.BufferAttribute(new Float32Array(strokeAlphas), 1));
+    geometry.setIndex(indices);
+    object = new THREE.Mesh(geometry, bundle.lineMaterial);
+  } else {
+    const positions = new Float32Array((vertices.length / 2) * 3);
+    for (let i = 0, j = 0; i < vertices.length; i += 2, j += 3) {
+      positions[j] = vertices[i];
+      positions[j + 1] = vertices[i + 1];
+      positions[j + 2] = 0;
+    }
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('a_alpha', new THREE.BufferAttribute(new Float32Array(alphas), 1));
+    object = new THREE.Points(geometry, bundle.pointMaterial);
+  }
 
   const material = mode === 'points' ? bundle.pointMaterial : bundle.lineMaterial;
   material.uniforms.u_color.value.set(color[0], color[1], color[2], color[3]);
-  if (mode === 'points' && pointSize !== undefined) {
-    bundle.pointMaterial.uniforms.u_pointSize.value = pointSize;
+  if (mode === 'points' && size !== undefined) {
+    bundle.pointMaterial.uniforms.u_pointSize.value = size;
   }
 
-  const object = mode === 'points'
-    ? new THREE.Points(geometry, material)
-    : new THREE.LineSegments(geometry, material);
   bundle.scene.add(object);
   bundle.renderer.render(bundle.scene, bundle.camera);
   bundle.scene.remove(object);
@@ -689,8 +736,9 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   const weights = new Float32Array(pool.nodes.length);
   const active = new Uint8Array(pool.nodes.length);
   const connected = new Uint8Array(pool.nodes.length);
+  const useSvgNoiseField = settings.source === 'svg' && shouldUseNoiseInsideSvg(settings);
   const threshold = settings.source === 'svg'
-    ? (settings.svgNoiseEnabled ? 0.26 : 0.5)
+    ? (useSvgNoiseField ? 0.26 : 0.5)
     : 0.38 - settings.nodeDensity * 0.16;
   const lineVertices: number[] = [];
   const lineAlphas: number[] = [];
@@ -712,7 +760,7 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   for (const edge of pool.edges) {
     if (!active[edge.a.id] || !active[edge.b.id]) continue;
     const midpointWeight = morphValue(edge.baseWeight, edge.morphWeights, settings, phase);
-    if (midpointWeight < (settings.source === 'svg' ? (settings.svgNoiseEnabled ? 0.24 : 0.5) : 0.22)) continue;
+    if (midpointWeight < (settings.source === 'svg' ? (useSvgNoiseField ? 0.24 : 0.5) : 0.22)) continue;
     if (edge.gate >= 0.16 + settings.connectionDensity * 0.46 + edge.angle * settings.angleBias * 0.24) continue;
     const targetVertices = pool.pathEdges.has(edge.id) ? pathVertices : lineVertices;
     const targetAlphas = pool.pathEdges.has(edge.id) ? pathAlphas : lineAlphas;
@@ -791,9 +839,9 @@ function renderWebgl(bundle: GlBundle, pool: PatternPool, settings: NoiseSetting
   bundle.renderer.clear();
 
   const frame = buildFrameGeometry(pool, settings, phase, mask);
-  drawVertices(bundle, frame.lineVertices, frame.lineAlphas, 'lines', hexToRgba(settings.lineColor, 0.9));
-  drawVertices(bundle, frame.stubVertices, frame.stubAlphas, 'lines', hexToRgba(settings.lineColor, 0.72));
-  drawVertices(bundle, frame.pathVertices, frame.pathAlphas, 'lines', hexToRgba(settings.pathColor, 0.96));
+  drawVertices(bundle, frame.lineVertices, frame.lineAlphas, 'lines', hexToRgba(settings.lineColor, 0.9), settings.lineWidth);
+  drawVertices(bundle, frame.stubVertices, frame.stubAlphas, 'lines', hexToRgba(settings.lineColor, 0.72), settings.lineWidth * 0.82);
+  drawVertices(bundle, frame.pathVertices, frame.pathAlphas, 'lines', hexToRgba(settings.pathColor, 0.96), settings.pathThickness);
   drawVertices(bundle, frame.nodeVertices, frame.nodeAlphas, 'points', hexToRgba(settings.nodeColor, 1), Math.max(1.2, settings.nodeSize * 2.3));
   drawVertices(bundle, frame.stubNodeVertices, frame.stubNodeAlphas, 'points', hexToRgba(settings.nodeColor, 0.88), Math.max(1, settings.nodeSize * 1.45));
 }
