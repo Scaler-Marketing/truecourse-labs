@@ -1,8 +1,21 @@
-import { useEffect, useRef, useState } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type SetStateAction,
+} from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { SVGLoader } from 'three/examples/jsm/loaders/SVGLoader.js';
 import { hashSeed } from '../generation/random';
+
+export type PathWaypoint = {
+  x: number;
+  y: number;
+};
 
 export type NoiseSettings = {
   seed: string;
@@ -36,6 +49,9 @@ export type NoiseSettings = {
   lineColor: string;
   nodeColor: string;
   pathEnabled: boolean;
+  pathMode: 'auto' | 'manual';
+  pathManualPoints: PathWaypoint[];
+  pathSnapRadius: number;
   pathThickness: number;
   pathEndpointSpread: number;
   pathColor: string;
@@ -73,10 +89,20 @@ type PoolEdge = {
   morphWeights: [number, number, number, number];
 };
 
+type PathConnection = {
+  a: { x: number; y: number };
+  b: { x: number; y: number };
+  aId?: number;
+  bId?: number;
+  weight: number;
+};
+
 type PatternPool = {
   nodes: PoolNode[];
   edges: PoolEdge[];
   pathEdges: Set<number>;
+  pathConnections: PathConnection[];
+  pathPointIds: Set<number>;
 };
 
 type FieldMask = {
@@ -383,31 +409,59 @@ function buildPatternPool(settings: NoiseSettings, mask: FieldMask | null): Patt
     }
   }
 
+  const path = settings.pathEnabled ? findPoolPath(nodes, edges, settings) : {
+    edges: new Set<number>(),
+    connections: [] as PathConnection[],
+    pointIds: new Set<number>(),
+  };
+
   return {
     nodes,
     edges,
-    pathEdges: settings.pathEnabled ? findPoolPathEdges(nodes, edges, settings) : new Set<number>(),
+    pathEdges: path.edges,
+    pathConnections: path.connections,
+    pathPointIds: path.pointIds,
   };
 }
 
 function chooseEndpoints(nodes: PoolNode[], settings: NoiseSettings) {
   if (nodes.length < 2) return null;
-  const marginX = settings.width * (0.04 + (1 - settings.pathEndpointSpread) * 0.22);
-  const marginY = settings.height * 0.08;
+  const horizontal = settings.width >= settings.height;
+  const majorSize = horizontal ? settings.width : settings.height;
+  const crossSize = horizontal ? settings.height : settings.width;
+  const majorMargin = majorSize * (0.04 + (1 - settings.pathEndpointSpread) * 0.18);
+  const crossCenter = crossSize * 0.5;
+  const crossLimit = crossSize * (0.18 + settings.pathEndpointSpread * 0.24);
+  const marginX = horizontal ? majorMargin : settings.width * 0.08;
+  const marginY = horizontal ? settings.height * 0.08 : majorMargin;
   const pool = nodes.filter((node) => (
     node.x > marginX
     && node.x < settings.width - marginX
     && node.y > marginY
     && node.y < settings.height - marginY
   ));
-  const candidates = pool.length > 2 ? pool : nodes;
-  let best: [PoolNode, PoolNode] = [candidates[0], candidates[1]];
+
+  const central = pool.filter((node) => {
+    const cross = horizontal ? node.y : node.x;
+    return Math.abs(cross - crossCenter) <= crossLimit;
+  });
+  const candidates = central.length > 2 ? central : pool.length > 2 ? pool : nodes;
+  const startCandidates = candidates.filter((node) => (horizontal ? node.x : node.y) < majorSize * 0.42);
+  const endCandidates = candidates.filter((node) => (horizontal ? node.x : node.y) > majorSize * 0.58);
+  const starts = startCandidates.length ? startCandidates : candidates;
+  const ends = endCandidates.length ? endCandidates : candidates;
+  let best: [PoolNode, PoolNode] = [starts[0], ends[0] === starts[0] ? ends[1] ?? candidates[1] : ends[0]];
   let bestScore = -Infinity;
-  for (let i = 0; i < candidates.length; i += Math.max(1, Math.floor(candidates.length / 120))) {
-    for (let j = i + 1; j < candidates.length; j += Math.max(1, Math.floor(candidates.length / 120))) {
-      const a = candidates[i];
-      const b = candidates[j];
-      const score = Math.hypot(a.x - b.x, a.y - b.y);
+  for (let i = 0; i < starts.length; i += Math.max(1, Math.floor(starts.length / 80))) {
+    for (let j = 0; j < ends.length; j += Math.max(1, Math.floor(ends.length / 80))) {
+      const a = starts[i];
+      const b = ends[j];
+      if (a.id === b.id) continue;
+      const majorDistance = Math.abs((horizontal ? b.x - a.x : b.y - a.y));
+      const crossA = horizontal ? a.y : a.x;
+      const crossB = horizontal ? b.y : b.x;
+      const crossPenalty = Math.abs(crossA - crossCenter) + Math.abs(crossB - crossCenter) + Math.abs(crossA - crossB) * 0.35;
+      const score = majorDistance - crossPenalty * 0.62;
       if (score > bestScore) {
         bestScore = score;
         best = [a, b];
@@ -417,17 +471,103 @@ function chooseEndpoints(nodes: PoolNode[], settings: NoiseSettings) {
   return best;
 }
 
-function findPoolPathEdges(nodes: PoolNode[], edges: PoolEdge[], settings: NoiseSettings) {
-  const endpoints = chooseEndpoints(nodes, settings);
-  if (!endpoints) return new Set<number>();
-  const [start, end] = endpoints;
+function fallbackPathConnections(settings: NoiseSettings) {
+  const seed = hashSeed(settings.seed) + 911;
+  const random = rng(seed);
+  const horizontal = settings.width >= settings.height;
+  const majorSize = horizontal ? settings.width : settings.height;
+  const crossSize = horizontal ? settings.height : settings.width;
+  const majorMargin = majorSize * 0.08;
+  const crossCenter = crossSize * 0.5;
+  const crossDrift = crossSize * 0.035;
+  const pointCount = 9;
+  const points: Array<{ x: number; y: number }> = [];
+
+  for (let i = 0; i < pointCount; i += 1) {
+    const t = i / (pointCount - 1);
+    const major = majorMargin + (majorSize - majorMargin * 2) * t;
+    const wave = Math.sin(t * Math.PI * 2 + random() * Math.PI) * crossDrift;
+    const jitter = (random() - 0.5) * crossDrift;
+    const cross = crossCenter + wave + jitter;
+    points.push(horizontal ? { x: major, y: cross } : { x: cross, y: major });
+  }
+
+  const connections: PathConnection[] = [];
+  for (let i = 1; i < points.length; i += 1) {
+    connections.push({ a: points[i - 1], b: points[i], weight: 0.82 });
+  }
+  return connections;
+}
+
+function nearestNodeToWaypoint(nodes: PoolNode[], waypoint: PathWaypoint, settings: NoiseSettings) {
+  let closest: PoolNode | null = null;
+  let closestDistance = Infinity;
+  const x = waypoint.x * settings.width;
+  const y = waypoint.y * settings.height;
+
+  for (const node of nodes) {
+    const distance = Math.hypot(node.x - x, node.y - y);
+    if (distance < closestDistance) {
+      closestDistance = distance;
+      closest = node;
+    }
+  }
+
+  return closest;
+}
+
+function chooseEndpointFromAnchor(nodes: PoolNode[], anchor: PoolNode, settings: NoiseSettings) {
+  const horizontal = settings.width >= settings.height;
+  const majorSize = horizontal ? settings.width : settings.height;
+  const crossCenter = (horizontal ? settings.height : settings.width) * 0.5;
+  let best: PoolNode | null = null;
+  let bestScore = -Infinity;
+
+  for (const node of nodes) {
+    if (node.id === anchor.id) continue;
+    const majorDistance = Math.abs((horizontal ? node.x - anchor.x : node.y - anchor.y));
+    const anchorMajor = horizontal ? anchor.x : anchor.y;
+    const nodeMajor = horizontal ? node.x : node.y;
+    const crossesComposition = anchorMajor < majorSize * 0.5
+      ? nodeMajor > majorSize * 0.58
+      : nodeMajor < majorSize * 0.42;
+    const cross = horizontal ? node.y : node.x;
+    const centerPenalty = Math.abs(cross - crossCenter);
+    const score = majorDistance + (crossesComposition ? majorSize * 0.35 : 0) - centerPenalty * 0.45;
+    if (score > bestScore) {
+      bestScore = score;
+      best = node;
+    }
+  }
+
+  return best;
+}
+
+function buildPathAdjacency(edges: PoolEdge[], settings: NoiseSettings) {
+  const horizontal = settings.width >= settings.height;
+  const crossCenter = (horizontal ? settings.height : settings.width) * 0.5;
+  const crossSize = horizontal ? settings.height : settings.width;
   const adjacency = new Map<number, Array<{ to: number; edgeIndex: number; cost: number }>>();
+
   edges.forEach((edge, edgeIndex) => {
-    const cost = Math.hypot(edge.a.x - edge.b.x, edge.a.y - edge.b.y);
+    const distance = Math.hypot(edge.a.x - edge.b.x, edge.a.y - edge.b.y);
+    const midpointCross = horizontal ? (edge.a.y + edge.b.y) * 0.5 : (edge.a.x + edge.b.x) * 0.5;
+    const centerPenalty = Math.abs(midpointCross - crossCenter) / crossSize;
+    const weightReward = Math.max(0, Math.min(1, edge.baseWeight));
+    const cost = distance * (1 + centerPenalty * 1.8 + (1 - weightReward) * 0.28);
     adjacency.set(edge.a.id, [...(adjacency.get(edge.a.id) ?? []), { to: edge.b.id, edgeIndex, cost }]);
     adjacency.set(edge.b.id, [...(adjacency.get(edge.b.id) ?? []), { to: edge.a.id, edgeIndex, cost }]);
   });
 
+  return adjacency;
+}
+
+function findPathSegment(
+  nodes: PoolNode[],
+  adjacency: Map<number, Array<{ to: number; edgeIndex: number; cost: number }>>,
+  start: PoolNode,
+  end: PoolNode,
+) {
   const distances = new Map<number, number>([[start.id, 0]]);
   const previous = new Map<number, { node: number; edgeIndex: number }>();
   const queue = new Set(nodes.map((node) => node.id));
@@ -455,14 +595,89 @@ function findPoolPathEdges(nodes: PoolNode[], edges: PoolEdge[], settings: Noise
     }
   }
 
-  const path = new Set<number>();
+  const orderedEdges: number[] = [];
   let cursor = end.id;
   while (previous.has(cursor)) {
     const step = previous.get(cursor)!;
-    path.add(step.edgeIndex);
+    orderedEdges.push(step.edgeIndex);
     cursor = step.node;
   }
-  return path;
+
+  return cursor === start.id ? orderedEdges.reverse() : [];
+}
+
+function orderedConnectionsFromEdges(edges: PoolEdge[], orderedEdges: number[]) {
+  return orderedEdges.map((edgeIndex) => {
+    const edge = edges[edgeIndex];
+    return {
+      a: edge.a,
+      b: edge.b,
+      aId: edge.a.id,
+      bId: edge.b.id,
+      weight: edge.baseWeight,
+    };
+  });
+}
+
+function findPoolPath(nodes: PoolNode[], edges: PoolEdge[], settings: NoiseSettings) {
+  const pointIds = new Set<number>();
+  const manualNodes = settings.pathMode === 'manual'
+    ? settings.pathManualPoints
+      .map((point) => nearestNodeToWaypoint(nodes, point, settings))
+      .filter((node): node is PoolNode => Boolean(node))
+      .filter((node, index, list) => list.findIndex((item) => item.id === node.id) === index)
+    : [];
+  for (const node of manualNodes) pointIds.add(node.id);
+
+  let routeNodes = manualNodes;
+  if (routeNodes.length === 0) {
+    const endpoints = chooseEndpoints(nodes, settings);
+    if (!endpoints) {
+      return {
+        edges: new Set<number>(),
+        connections: fallbackPathConnections(settings),
+        pointIds,
+      };
+    }
+    routeNodes = endpoints;
+  } else if (routeNodes.length === 1) {
+    const end = chooseEndpointFromAnchor(nodes, routeNodes[0], settings);
+    if (end) routeNodes = [routeNodes[0], end];
+  }
+
+  if (routeNodes.length < 2) {
+    return {
+      edges: new Set<number>(),
+      connections: fallbackPathConnections(settings),
+      pointIds,
+    };
+  }
+
+  const adjacency = buildPathAdjacency(edges, settings);
+  const orderedEdges: number[] = [];
+  const directConnections: PathConnection[] = [];
+  for (let i = 1; i < routeNodes.length; i += 1) {
+    const segment = findPathSegment(nodes, adjacency, routeNodes[i - 1], routeNodes[i]);
+    if (segment.length) {
+      orderedEdges.push(...segment);
+    } else {
+      directConnections.push({
+        a: routeNodes[i - 1],
+        b: routeNodes[i],
+        aId: routeNodes[i - 1].id,
+        bId: routeNodes[i].id,
+        weight: (routeNodes[i - 1].baseWeight + routeNodes[i].baseWeight) * 0.5,
+      });
+    }
+  }
+  const path = new Set(orderedEdges);
+  const connections = [...orderedConnectionsFromEdges(edges, orderedEdges), ...directConnections];
+
+  return {
+    edges: path,
+    connections: connections.length ? connections : fallbackPathConnections(settings),
+    pointIds,
+  };
 }
 
 function createGlBundle(canvas: HTMLCanvasElement): GlBundle | null {
@@ -765,6 +980,8 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   const lineAlphas: number[] = [];
   const pathVertices: number[] = [];
   const pathAlphas: number[] = [];
+  const pathPointVertices: number[] = [];
+  const pathPointAlphas: number[] = [];
   const nodeVertices: number[] = [];
   const nodeAlphas: number[] = [];
   const stubVertices: number[] = [];
@@ -781,6 +998,7 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   }
 
   for (const edge of pool.edges) {
+    if (pool.pathEdges.has(edge.id)) continue;
     if (!active[edge.a.id] || !active[edge.b.id]) continue;
     const midpointX = (edge.a.x + edge.b.x) * 0.5;
     const midpointY = (edge.a.y + edge.b.y) * 0.5;
@@ -789,14 +1007,12 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
       : morphValue(edge.baseWeight, edge.morphWeights, settings, phase);
     if (midpointWeight < (isMaskedSource(settings) ? (useSvgNoiseField ? 0.24 : 0.5) : 0.22)) continue;
     if (edge.gate >= 0.16 + settings.connectionDensity * 0.46 + edge.angle * settings.angleBias * 0.24) continue;
-    const targetVertices = pool.pathEdges.has(edge.id) ? pathVertices : lineVertices;
-    const targetAlphas = pool.pathEdges.has(edge.id) ? pathAlphas : lineAlphas;
     const desiredOrganicity = isMaskedSource(settings) ? settings.organicity * 1.25 : settings.organicity * 1.45;
     const organicity = maskedOrganicity(mask, settings, edge.a, edge.b, desiredOrganicity);
     if (organicity === null) continue;
     pushConnection(
-      targetVertices,
-      targetAlphas,
+      lineVertices,
+      lineAlphas,
       edge.a,
       edge.b,
       0.34 + midpointWeight * 0.48,
@@ -804,6 +1020,42 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
     );
     connected[edge.a.id] = 1;
     connected[edge.b.id] = 1;
+  }
+
+  for (const connection of pool.pathConnections) {
+    const desiredOrganicity = isMaskedSource(settings) ? settings.organicity * 1.05 : settings.organicity * 0.95;
+    const organicity = isMaskedSource(settings)
+      ? maskedOrganicity(mask, settings, connection.a, connection.b, desiredOrganicity)
+      : desiredOrganicity;
+    if (organicity === null) continue;
+    pushConnection(
+      pathVertices,
+      pathAlphas,
+      connection.a,
+      connection.b,
+      0.82 + Math.max(0, Math.min(1, connection.weight)) * 0.14,
+      organicity,
+    );
+    if (connection.aId !== undefined) {
+      active[connection.aId] = 1;
+      connected[connection.aId] = 1;
+      weights[connection.aId] = Math.max(weights[connection.aId], 0.72);
+    }
+    if (connection.bId !== undefined) {
+      active[connection.bId] = 1;
+      connected[connection.bId] = 1;
+      weights[connection.bId] = Math.max(weights[connection.bId], 0.72);
+    }
+  }
+
+  for (const nodeId of pool.pathPointIds) {
+    const node = pool.nodes[nodeId];
+    if (!node) continue;
+    pathPointVertices.push(node.x, node.y);
+    pathPointAlphas.push(1);
+    active[node.id] = 1;
+    connected[node.id] = 1;
+    weights[node.id] = Math.max(weights[node.id], 0.84);
   }
 
   const stubChance = 0.015 + settings.organicity * 0.075;
@@ -845,6 +1097,8 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
     lineAlphas,
     pathVertices,
     pathAlphas,
+    pathPointVertices,
+    pathPointAlphas,
     nodeVertices,
     nodeAlphas,
     stubVertices,
@@ -871,6 +1125,7 @@ function renderWebgl(bundle: GlBundle, pool: PatternPool, settings: NoiseSetting
   drawVertices(bundle, frame.lineVertices, frame.lineAlphas, 'lines', hexToRgba(settings.lineColor, 0.9), settings.lineWidth);
   drawVertices(bundle, frame.stubVertices, frame.stubAlphas, 'lines', hexToRgba(settings.lineColor, 0.72), settings.lineWidth * 0.82);
   drawVertices(bundle, frame.pathVertices, frame.pathAlphas, 'lines', hexToRgba(settings.pathColor, 0.96), settings.pathThickness);
+  drawVertices(bundle, frame.pathPointVertices, frame.pathPointAlphas, 'points', hexToRgba(settings.pathColor, 1), Math.max(5.5, settings.pathThickness * 2.6));
   drawVertices(bundle, frame.nodeVertices, frame.nodeAlphas, 'points', hexToRgba(settings.nodeColor, 1), Math.max(1.2, settings.nodeSize * 2.3));
   drawVertices(bundle, frame.stubNodeVertices, frame.stubNodeAlphas, 'points', hexToRgba(settings.nodeColor, 0.88), Math.max(1, settings.nodeSize * 1.45));
 }
@@ -1293,16 +1548,71 @@ async function exportLoopVideo(settings: NoiseSettings, orbit: SvgOrbit | null) 
   downloadBlob(blob, `truecourse-pattern-${settings.seed.replace(/[^a-z0-9-]/gi, '-')}.${extension}`);
 }
 
-export function NoiseCanvas({ settings }: { settings: NoiseSettings }) {
+type NoiseCanvasProps = {
+  settings: NoiseSettings;
+  pathEditEnabled?: boolean;
+  onPathPointsChange?: Dispatch<SetStateAction<PathWaypoint[]>>;
+};
+
+export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsChange }: NoiseCanvasProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const glRef = useRef<GlBundle | null>(null);
+  const poolRef = useRef<PatternPool | null>(null);
   const orbitRef = useRef<SvgOrbit | null>(null);
   const lastVideoNonceRef = useRef(settings.videoExportNonce);
   const [sourceMask, setSourceMask] = useState<FieldMask | null>(null);
   const [orbitRevision, setOrbitRevision] = useState(0);
   const [previewSize, setPreviewSize] = useState<PreviewSize | null>(null);
+
+  const handlePathPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    if (!pathEditEnabled || settings.pathMode !== 'manual' || !settings.pathEnabled || !onPathPointsChange) return;
+    const pool = poolRef.current;
+    const canvas = canvasRef.current;
+    if (!pool?.nodes.length || !canvas) return;
+
+    event.preventDefault();
+    const bounds = canvas.getBoundingClientRect();
+    const x = ((event.clientX - bounds.left) / Math.max(1, bounds.width)) * settings.width;
+    const y = ((event.clientY - bounds.top) / Math.max(1, bounds.height)) * settings.height;
+    const closest = nearestNodeToWaypoint(pool.nodes, { x: x / settings.width, y: y / settings.height }, settings);
+    if (!closest || Math.hypot(closest.x - x, closest.y - y) > settings.pathSnapRadius) return;
+    const waypoint = {
+      x: Math.max(0, Math.min(1, closest.x / settings.width)),
+      y: Math.max(0, Math.min(1, closest.y / settings.height)),
+    };
+    const shouldRemove = event.button === 2 || event.altKey || event.shiftKey;
+
+    onPathPointsChange((points) => {
+      if (shouldRemove) {
+        let removeIndex = -1;
+        let removeDistance = Infinity;
+        for (let index = 0; index < points.length; index += 1) {
+          const distance = Math.hypot(
+            points[index].x * settings.width - closest.x,
+            points[index].y * settings.height - closest.y,
+          );
+          if (distance < removeDistance) {
+            removeDistance = distance;
+            removeIndex = index;
+          }
+        }
+        if (removeIndex === -1 || removeDistance > settings.pathSnapRadius * 1.6) return points;
+        return points.filter((_, index) => index !== removeIndex);
+      }
+
+      const duplicate = points.some((point) => (
+        Math.hypot(point.x * settings.width - closest.x, point.y * settings.height - closest.y) <= settings.pathSnapRadius * 0.8
+      ));
+      return duplicate ? points : [...points, waypoint];
+    });
+  };
+
+  const handlePathContextMenu = (event: ReactMouseEvent<HTMLCanvasElement>) => {
+    if (!pathEditEnabled || settings.pathMode !== 'manual') return;
+    event.preventDefault();
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1421,6 +1731,7 @@ export function NoiseCanvas({ settings }: { settings: NoiseSettings }) {
 
     if (dynamicSourceMask) {
       const stableVideoPool = animatedVideo ? buildPatternPool(settings, null) : null;
+      if (stableVideoPool) poolRef.current = stableVideoPool;
       let animationId = 0;
       let lastFrameAt = 0;
 
@@ -1430,6 +1741,7 @@ export function NoiseCanvas({ settings }: { settings: NoiseSettings }) {
         const mask = await createSourceMask(settings, phase, orbitRef.current, animatedVideo ? 'play' : 'seek');
         if (!cancelled) {
           const pool = stableVideoPool ?? buildPatternPool(settings, mask);
+          poolRef.current = pool;
           renderWebgl(bundle, pool, settings, mask, phase);
           drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), phase, mask);
         }
@@ -1458,6 +1770,7 @@ export function NoiseCanvas({ settings }: { settings: NoiseSettings }) {
     }
 
     const pool = buildPatternPool(settings, sourceMask);
+    poolRef.current = pool;
     let animationId = 0;
     let lastFrameAt = 0;
 
@@ -1495,7 +1808,14 @@ export function NoiseCanvas({ settings }: { settings: NoiseSettings }) {
         className="preview-frame"
         style={previewSize ? { width: `${previewSize.width}px`, height: `${previewSize.height}px` } : undefined}
       >
-        <canvas ref={canvasRef} className="pattern-canvas lab-canvas noise-canvas" aria-label="Weighted network preview" />
+        <canvas
+          ref={canvasRef}
+          className="pattern-canvas lab-canvas noise-canvas"
+          aria-label="Weighted network preview"
+          onPointerDown={handlePathPointerDown}
+          onContextMenu={handlePathContextMenu}
+          style={pathEditEnabled && settings.pathMode === 'manual' ? { cursor: 'crosshair' } : undefined}
+        />
         <canvas ref={overlayRef} className="noise-map-canvas" aria-hidden="true" hidden />
       </div>
     </div>

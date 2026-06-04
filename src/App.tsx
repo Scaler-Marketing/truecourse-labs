@@ -3,7 +3,7 @@ import { DialRoot, DialStore, useDialKit, type DialConfig } from 'dialkit';
 import 'dialkit/styles.css';
 import './App.css';
 import { BlobsCanvas, type BlobsSettings } from './components/BlobsCanvas';
-import { NoiseCanvas, type NoiseSettings } from './components/NoiseCanvas';
+import { NoiseCanvas, type NoiseSettings, type PathWaypoint } from './components/NoiseCanvas';
 
 const defaultSeed = 'TC-48291';
 
@@ -70,8 +70,12 @@ type LabControls = {
   };
   Path?: {
     enabled: boolean;
+    mode: string;
+    edit: boolean;
+    clearPoints?: boolean;
     thickness: number;
     endpointSpread: number;
+    snapRadius: number;
     color: string;
   };
   Motion: {
@@ -115,6 +119,8 @@ function createDialConfig(
   svgNoiseEnabled: boolean,
   svgMode: SvgMode,
   videoDuration: number | null,
+  pathEnabled: boolean,
+  pathMode: string,
 ): DialConfig {
   const effectiveLoopDuration = bindingsSource === 'video'
     ? Math.max(0.25, videoDuration ?? 8)
@@ -161,11 +167,15 @@ function createDialConfig(
             complexity: slider(0.5, 0, 1, 0.01),
             contrast: slider(0.58, 0, 1, 0.01),
             brightness: slider(0.48, 0, 1, 0.01),
-            videoThreshold: slider(0.5, 0, 1, 0.01),
-            videoInvert: false,
-            videoPositionX: slider(0, -1, 1, 0.01),
-            videoPositionY: slider(0, -1, 1, 0.01),
-            videoScale: slider(1, 0.1, 2.5, 0.01),
+            ...(bindingsSource === 'video'
+              ? {
+                  videoThreshold: slider(0.5, 0, 1, 0.01),
+                  videoInvert: false,
+                  videoPositionX: slider(0, -1, 1, 0.01),
+                  videoPositionY: slider(0, -1, 1, 0.01),
+                  videoScale: slider(1, 0.1, 2.5, 0.01),
+                }
+              : {}),
             showMap: false,
             nodeDensity: slider(0.64, 0.05, 1, 0.01),
             connectionDensity: slider(0.74, 0, 1, 0.01),
@@ -211,8 +221,27 @@ function createDialConfig(
             : {}),
           Path: {
             enabled: true,
+            ...(pathEnabled
+              ? {
+                  mode: {
+                    type: 'select',
+                    default: pathMode === 'manual' ? 'manual' : 'auto',
+                    options: [
+                      { value: 'auto', label: 'Auto' },
+                      { value: 'manual', label: 'Manual' },
+                    ],
+                  },
+                  ...(pathMode === 'manual'
+                    ? {
+                        edit: false,
+                        clearPoints: { type: 'action', label: 'Clear Points' },
+                      }
+                    : {}),
+                }
+              : {}),
             thickness: slider(1.35, 0.4, 8, 0.1),
             endpointSpread: slider(0.72, 0, 1, 0.01),
+            snapRadius: slider(18, 4, 80, 1),
             color: '#FFFFFF',
           },
         }
@@ -284,6 +313,7 @@ function createBindingsSettings(
   svgDataUrl: string | null,
   videoDataUrl: string | null,
   videoDuration: number | null,
+  pathManualPoints: PathWaypoint[],
 ): NoiseSettings {
   const bindings = controls.Bindings;
   const svg = controls.SVG;
@@ -323,6 +353,9 @@ function createBindingsSettings(
     lineColor: bindings?.lineColor ?? '#7DB2FF',
     nodeColor: bindings?.nodeColor ?? '#D9EAFF',
     pathEnabled: path?.enabled ?? true,
+    pathMode: path?.mode === 'manual' ? 'manual' : 'auto',
+    pathManualPoints,
+    pathSnapRadius: path?.snapRadius ?? 18,
     pathThickness: path?.thickness ?? 1.35,
     pathEndpointSpread: path?.endpointSpread ?? 0.72,
     pathColor: path?.color ?? '#FFFFFF',
@@ -373,6 +406,8 @@ function Lab() {
   const [bindingsSource, setBindingsSource] = useState<BindingsSource>('noise');
   const [svgNoiseEnabled, setSvgNoiseEnabled] = useState(false);
   const [svgMode, setSvgMode] = useState<SvgMode>('2d');
+  const [pathEnabled, setPathEnabled] = useState(true);
+  const [pathMode, setPathMode] = useState<'auto' | 'manual'>('auto');
   const svgInputRef = useRef<HTMLInputElement | null>(null);
   const videoInputRef = useRef<HTMLInputElement | null>(null);
   const [svgDataUrl, setSvgDataUrl] = useState<string | null>(null);
@@ -382,9 +417,10 @@ function Lab() {
   const [nonce, setNonce] = useState(0);
   const [pendingExport, setPendingExport] = useState(false);
   const [videoExportNonce, setVideoExportNonce] = useState(0);
+  const [pathManualPoints, setPathManualPoints] = useState<PathWaypoint[]>([]);
   const config = useMemo(
-    () => createDialConfig(shaderMode, bindingsSource, svgNoiseEnabled, svgMode, videoDuration),
-    [bindingsSource, shaderMode, svgMode, svgNoiseEnabled, videoDuration],
+    () => createDialConfig(shaderMode, bindingsSource, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode),
+    [bindingsSource, pathEnabled, pathMode, shaderMode, svgMode, svgNoiseEnabled, videoDuration],
   );
   const panelName = useMemo(() => {
     if (shaderMode === 'bindings') return `Noise Field / ${bindingsSource}${bindingsSource === 'video' ? ` / ${videoDuration ?? 'pending'}` : ''}`;
@@ -404,6 +440,7 @@ function Lab() {
         if (action === 'reset') window.location.reload();
         if (action === 'Bindings.loadSvg' || action === 'loadSvg') svgInputRef.current?.click();
         if (action === 'Bindings.loadVideo' || action === 'loadVideo') videoInputRef.current?.click();
+        if (action === 'Path.clearPoints' || action === 'clearPoints') setPathManualPoints([]);
         if (action === 'Export.exportPng' || action === 'exportPng') setPendingExport(true);
         if (action === 'Export.exportMp4' || action === 'exportMp4') setVideoExportNonce((value) => value + 1);
       },
@@ -437,6 +474,16 @@ function Lab() {
   }, [controls.SVG?.mode, svgMode]);
 
   useEffect(() => {
+    const nextPathEnabled = controls.Path?.enabled ?? true;
+    if (nextPathEnabled !== pathEnabled) setPathEnabled(nextPathEnabled);
+  }, [controls.Path?.enabled, pathEnabled]);
+
+  useEffect(() => {
+    const nextPathMode = controls.Path?.mode === 'manual' ? 'manual' : 'auto';
+    if (nextPathMode !== pathMode) setPathMode(nextPathMode);
+  }, [controls.Path?.mode, pathMode]);
+
+  useEffect(() => {
     if (bindingsSource !== 'video' || !videoDuration) return;
     const panel = DialStore.getPanels().find((item) => item.name === panelName);
     if (!panel) return;
@@ -467,8 +514,8 @@ function Lab() {
     const seed = `${seedOverride ?? controls.Shader.seed}:${nonce}`;
     return shaderMode === 'blobs'
       ? { mode: 'blobs', values: createBlobsSettings(controls, seed, videoExportNonce) }
-      : { mode: 'bindings', values: createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, videoDuration) };
-  }, [controls, nonce, seedOverride, shaderMode, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
+      : { mode: 'bindings', values: createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, videoDuration, pathManualPoints) };
+  }, [controls, nonce, pathManualPoints, seedOverride, shaderMode, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
 
   const debouncedSettings = useDebouncedValue(settings, 35);
 
@@ -523,7 +570,13 @@ function Lab() {
       <section className="work-area">
         {debouncedSettings.mode === 'blobs'
           ? <BlobsCanvas settings={debouncedSettings.values} />
-          : <NoiseCanvas settings={debouncedSettings.values} />}
+          : (
+              <NoiseCanvas
+                settings={debouncedSettings.values}
+                pathEditEnabled={controls.Path?.edit ?? false}
+                onPathPointsChange={setPathManualPoints}
+              />
+            )}
       </section>
 
       <aside className="control-rail">
