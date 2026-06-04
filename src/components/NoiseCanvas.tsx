@@ -105,6 +105,21 @@ type PatternPool = {
   pathPointIds: Set<number>;
 };
 
+type FrameGeometry = {
+  lineVertices: number[];
+  lineAlphas: number[];
+  pathVertices: number[];
+  pathAlphas: number[];
+  pathPointVertices: number[];
+  pathPointAlphas: number[];
+  nodeVertices: number[];
+  nodeAlphas: number[];
+  stubVertices: number[];
+  stubAlphas: number[];
+  stubNodeVertices: number[];
+  stubNodeAlphas: number[];
+};
+
 type FieldMask = {
   width: number;
   height: number;
@@ -158,6 +173,74 @@ type GlBundle = {
   lineMaterial: THREE.ShaderMaterial;
   pointMaterial: THREE.ShaderMaterial;
 };
+
+type PatternPoolCache = {
+  key: string;
+  mask: FieldMask | null;
+  pool: PatternPool;
+};
+
+type PatternPoolCacheRef = {
+  current: PatternPoolCache | null;
+};
+
+type FrameGeometryCache = {
+  key: string;
+  mask: FieldMask | null;
+  frame: FrameGeometry;
+};
+
+type FrameGeometryCacheRef = {
+  current: FrameGeometryCache | null;
+};
+
+class MinHeap<T> {
+  private items: Array<{ item: T; priority: number }> = [];
+
+  push(item: T, priority: number) {
+    this.items.push({ item, priority });
+    this.bubbleUp(this.items.length - 1);
+  }
+
+  pop() {
+    if (!this.items.length) return null;
+    const top = this.items[0];
+    const last = this.items.pop();
+    if (last && this.items.length) {
+      this.items[0] = last;
+      this.bubbleDown(0);
+    }
+    return top;
+  }
+
+  get size() {
+    return this.items.length;
+  }
+
+  private bubbleUp(index: number) {
+    let current = index;
+    while (current > 0) {
+      const parent = Math.floor((current - 1) / 2);
+      if (this.items[parent].priority <= this.items[current].priority) break;
+      [this.items[parent], this.items[current]] = [this.items[current], this.items[parent]];
+      current = parent;
+    }
+  }
+
+  private bubbleDown(index: number) {
+    let current = index;
+    while (true) {
+      const left = current * 2 + 1;
+      const right = left + 1;
+      let smallest = current;
+      if (left < this.items.length && this.items[left].priority < this.items[smallest].priority) smallest = left;
+      if (right < this.items.length && this.items[right].priority < this.items[smallest].priority) smallest = right;
+      if (smallest === current) break;
+      [this.items[current], this.items[smallest]] = [this.items[smallest], this.items[current]];
+      current = smallest;
+    }
+  }
+}
 
 function smoothstep(t: number) {
   return t * t * (3 - 2 * t);
@@ -424,6 +507,106 @@ function buildPatternPool(settings: NoiseSettings, mask: FieldMask | null): Patt
   };
 }
 
+function createSourceMaskKey(settings: NoiseSettings) {
+  const resourceSignature = (value: string | null) => (
+    value ? `${value.length}:${value.slice(0, 48)}:${value.slice(-48)}` : null
+  );
+  if (settings.source === 'svg') {
+    return JSON.stringify({
+      source: settings.source,
+      svgDataUrl: resourceSignature(settings.svgDataUrl),
+      svgMode: settings.svgMode,
+      svgPositionX: settings.svgPositionX,
+      svgPositionY: settings.svgPositionY,
+      svgScale: settings.svgScale,
+      svgExtrude: settings.svgExtrude,
+      width: settings.width,
+      height: settings.height,
+    });
+  }
+  if (settings.source === 'video') {
+    return JSON.stringify({
+      source: settings.source,
+      videoDataUrl: resourceSignature(settings.videoDataUrl),
+      videoThreshold: settings.videoThreshold,
+      videoInvert: settings.videoInvert,
+      videoPositionX: settings.videoPositionX,
+      videoPositionY: settings.videoPositionY,
+      videoScale: settings.videoScale,
+      width: settings.width,
+      height: settings.height,
+    });
+  }
+  return 'noise';
+}
+
+function createPatternPoolKey(settings: NoiseSettings) {
+  return JSON.stringify({
+    seed: settings.seed,
+    source: settings.source,
+    svgMode: settings.svgMode,
+    svgNoiseEnabled: settings.svgNoiseEnabled,
+    size: settings.size,
+    complexity: settings.complexity,
+    contrast: settings.contrast,
+    brightness: settings.brightness,
+    nodeDensity: settings.nodeDensity,
+    connectionDensity: settings.connectionDensity,
+    angleBias: settings.angleBias,
+    organicity: settings.organicity,
+    pathEnabled: settings.pathEnabled,
+    pathMode: settings.pathMode,
+    pathManualPoints: settings.pathManualPoints,
+    pathEndpointSpread: settings.pathEndpointSpread,
+    motionEnabled: settings.motionEnabled,
+    width: settings.width,
+    height: settings.height,
+  });
+}
+
+function getCachedPatternPool(cacheRef: PatternPoolCacheRef, settings: NoiseSettings, mask: FieldMask | null) {
+  const key = createPatternPoolKey(settings);
+  const cached = cacheRef.current;
+  if (cached?.key === key && cached.mask === mask) return cached.pool;
+  const pool = buildPatternPool(settings, mask);
+  cacheRef.current = { key, mask, pool };
+  return pool;
+}
+
+function createFrameGeometryKey(pool: PatternPool, settings: NoiseSettings, phase: number) {
+  return JSON.stringify({
+    poolKey: createPatternPoolKey(settings),
+    phase: settings.motionEnabled ? Number(phase.toFixed(4)) : 0,
+    source: settings.source,
+    svgNoiseEnabled: settings.svgNoiseEnabled,
+    svgMode: settings.svgMode,
+    nodeDensity: settings.nodeDensity,
+    connectionDensity: settings.connectionDensity,
+    angleBias: settings.angleBias,
+    organicity: settings.organicity,
+    motionEnabled: settings.motionEnabled,
+    motionAmount: settings.motionAmount,
+    nodeCount: pool.nodes.length,
+    edgeCount: pool.edges.length,
+  });
+}
+
+function getCachedFrameGeometry(
+  cacheRef: FrameGeometryCacheRef | undefined,
+  pool: PatternPool,
+  settings: NoiseSettings,
+  phase: number,
+  mask: FieldMask | null,
+) {
+  if (!cacheRef || settings.motionEnabled) return buildFrameGeometry(pool, settings, phase, mask);
+  const key = createFrameGeometryKey(pool, settings, phase);
+  const cached = cacheRef.current;
+  if (cached?.key === key && cached.mask === mask) return cached.frame;
+  const frame = buildFrameGeometry(pool, settings, phase, mask);
+  cacheRef.current = { key, mask, frame };
+  return frame;
+}
+
 function chooseEndpoints(nodes: PoolNode[], settings: NoiseSettings) {
   if (nodes.length < 2) return null;
   const horizontal = settings.width >= settings.height;
@@ -563,34 +746,32 @@ function buildPathAdjacency(edges: PoolEdge[], settings: NoiseSettings) {
 }
 
 function findPathSegment(
-  nodes: PoolNode[],
   adjacency: Map<number, Array<{ to: number; edgeIndex: number; cost: number }>>,
   start: PoolNode,
   end: PoolNode,
 ) {
   const distances = new Map<number, number>([[start.id, 0]]);
   const previous = new Map<number, { node: number; edgeIndex: number }>();
-  const queue = new Set(nodes.map((node) => node.id));
+  const visited = new Set<number>();
+  const queue = new MinHeap<number>();
+  queue.push(start.id, 0);
 
   while (queue.size) {
-    let current = -1;
-    let best = Infinity;
-    for (const id of queue) {
-      const score = distances.get(id) ?? Infinity;
-      if (score < best) {
-        best = score;
-        current = id;
-      }
-    }
-    if (current === -1 || current === end.id) break;
-    queue.delete(current);
+    const nextNode = queue.pop();
+    if (!nextNode) break;
+    const current = nextNode.item;
+    const best = distances.get(current) ?? Infinity;
+    if (visited.has(current) || nextNode.priority > best) continue;
+    if (current === end.id) break;
+    visited.add(current);
 
     for (const next of adjacency.get(current) ?? []) {
-      if (!queue.has(next.to)) continue;
+      if (visited.has(next.to)) continue;
       const score = best + next.cost;
       if (score < (distances.get(next.to) ?? Infinity)) {
         distances.set(next.to, score);
         previous.set(next.to, { node: current, edgeIndex: next.edgeIndex });
+        queue.push(next.to, score);
       }
     }
   }
@@ -657,7 +838,7 @@ function findPoolPath(nodes: PoolNode[], edges: PoolEdge[], settings: NoiseSetti
   const orderedEdges: number[] = [];
   const directConnections: PathConnection[] = [];
   for (let i = 1; i < routeNodes.length; i += 1) {
-    const segment = findPathSegment(nodes, adjacency, routeNodes[i - 1], routeNodes[i]);
+    const segment = findPathSegment(adjacency, routeNodes[i - 1], routeNodes[i]);
     if (segment.length) {
       orderedEdges.push(...segment);
     } else {
@@ -967,7 +1148,7 @@ function drawNoiseMapOverlay(canvas: HTMLCanvasElement | null, settings: NoiseSe
   context.putImageData(image, 0, 0);
 }
 
-function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: number, mask: FieldMask | null) {
+function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: number, mask: FieldMask | null): FrameGeometry {
   const weights = new Float32Array(pool.nodes.length);
   const active = new Uint8Array(pool.nodes.length);
   const connected = new Uint8Array(pool.nodes.length);
@@ -1108,7 +1289,14 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   };
 }
 
-function renderWebgl(bundle: GlBundle, pool: PatternPool, settings: NoiseSettings, mask: FieldMask | null, phase = 0) {
+function renderWebgl(
+  bundle: GlBundle,
+  pool: PatternPool,
+  settings: NoiseSettings,
+  mask: FieldMask | null,
+  phase = 0,
+  frameCacheRef?: FrameGeometryCacheRef,
+) {
   const width = settings.width;
   const height = settings.height;
   bundle.renderer.setSize(width, height, false);
@@ -1121,7 +1309,7 @@ function renderWebgl(bundle: GlBundle, pool: PatternPool, settings: NoiseSetting
   bundle.renderer.setClearColor(new THREE.Color(background[0], background[1], background[2]), background[3]);
   bundle.renderer.clear();
 
-  const frame = buildFrameGeometry(pool, settings, phase, mask);
+  const frame = getCachedFrameGeometry(frameCacheRef, pool, settings, phase, mask);
   drawVertices(bundle, frame.lineVertices, frame.lineAlphas, 'lines', hexToRgba(settings.lineColor, 0.9), settings.lineWidth);
   drawVertices(bundle, frame.stubVertices, frame.stubAlphas, 'lines', hexToRgba(settings.lineColor, 0.72), settings.lineWidth * 0.82);
   drawVertices(bundle, frame.pathVertices, frame.pathAlphas, 'lines', hexToRgba(settings.pathColor, 0.96), settings.pathThickness);
@@ -1560,11 +1748,17 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
   const glRef = useRef<GlBundle | null>(null);
   const poolRef = useRef<PatternPool | null>(null);
+  const poolCacheRef = useRef<PatternPoolCache | null>(null);
+  const frameCacheRef = useRef<FrameGeometryCache | null>(null);
   const orbitRef = useRef<SvgOrbit | null>(null);
+  const latestSettingsRef = useRef(settings);
   const lastVideoNonceRef = useRef(settings.videoExportNonce);
   const [sourceMask, setSourceMask] = useState<FieldMask | null>(null);
   const [orbitRevision, setOrbitRevision] = useState(0);
   const [previewSize, setPreviewSize] = useState<PreviewSize | null>(null);
+  const sourceMaskKey = createSourceMaskKey(settings);
+
+  latestSettingsRef.current = settings;
 
   const handlePathPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!pathEditEnabled || settings.pathMode !== 'manual' || !settings.pathEnabled || !onPathPointsChange) return;
@@ -1697,8 +1891,9 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
 
   useEffect(() => {
     let cancelled = false;
-    const hasSourceFile = (settings.source === 'svg' && settings.svgDataUrl) || (settings.source === 'video' && settings.videoDataUrl);
-    if (!isMaskedSource(settings) || !hasSourceFile) {
+    const maskSettings = latestSettingsRef.current;
+    const hasSourceFile = (maskSettings.source === 'svg' && maskSettings.svgDataUrl) || (maskSettings.source === 'video' && maskSettings.videoDataUrl);
+    if (!isMaskedSource(maskSettings) || !hasSourceFile) {
       disposeSvg3dMaskCache();
       disposeVideoMaskCache();
       setSourceMask(null);
@@ -1706,18 +1901,18 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
         cancelled = true;
       };
     }
-    if (settings.svgMode !== '3d') disposeSvg3dMaskCache();
-    if (settings.source !== 'video') disposeVideoMaskCache();
+    if (maskSettings.svgMode !== '3d') disposeSvg3dMaskCache();
+    if (maskSettings.source !== 'video') disposeVideoMaskCache();
 
-    const videoPlayback = settings.source === 'video' && settings.motionEnabled ? 'play' : 'seek';
-    void createSourceMask(settings, 0, orbitRef.current, videoPlayback).then((mask) => {
+    const videoPlayback = maskSettings.source === 'video' && maskSettings.motionEnabled ? 'play' : 'seek';
+    void createSourceMask(maskSettings, 0, orbitRef.current, videoPlayback).then((mask) => {
       if (!cancelled) setSourceMask(mask);
     });
 
     return () => {
       cancelled = true;
     };
-  }, [orbitRevision, settings]);
+  }, [orbitRevision, sourceMaskKey]);
 
   useEffect(() => {
     const bundle = glRef.current;
@@ -1730,7 +1925,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
     let renderingDynamicMask = false;
 
     if (dynamicSourceMask) {
-      const stableVideoPool = animatedVideo ? buildPatternPool(settings, null) : null;
+      const stableVideoPool = animatedVideo ? getCachedPatternPool(poolCacheRef, settings, null) : null;
       if (stableVideoPool) poolRef.current = stableVideoPool;
       let animationId = 0;
       let lastFrameAt = 0;
@@ -1740,9 +1935,9 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
         renderingDynamicMask = true;
         const mask = await createSourceMask(settings, phase, orbitRef.current, animatedVideo ? 'play' : 'seek');
         if (!cancelled) {
-          const pool = stableVideoPool ?? buildPatternPool(settings, mask);
+          const pool = stableVideoPool ?? getCachedPatternPool(poolCacheRef, settings, mask);
           poolRef.current = pool;
-          renderWebgl(bundle, pool, settings, mask, phase);
+          renderWebgl(bundle, pool, settings, mask, phase, frameCacheRef);
           drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), phase, mask);
         }
         renderingDynamicMask = false;
@@ -1769,7 +1964,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
       };
     }
 
-    const pool = buildPatternPool(settings, sourceMask);
+    const pool = getCachedPatternPool(poolCacheRef, settings, sourceMask);
     poolRef.current = pool;
     let animationId = 0;
     let lastFrameAt = 0;
@@ -1779,13 +1974,13 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
       if (now - lastFrameAt >= frameInterval) {
         lastFrameAt = now;
         const phase = ((now / 1000) % settings.loopDuration) / settings.loopDuration;
-        renderWebgl(bundle, pool, settings, sourceMask, phase);
+        renderWebgl(bundle, pool, settings, sourceMask, phase, frameCacheRef);
         drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), phase, sourceMask);
       }
       animationId = window.requestAnimationFrame(tick);
     };
 
-    renderWebgl(bundle, pool, settings, sourceMask, 0);
+    renderWebgl(bundle, pool, settings, sourceMask, 0, frameCacheRef);
     drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), 0, sourceMask);
     if (settings.motionEnabled) animationId = window.requestAnimationFrame(tick);
 
