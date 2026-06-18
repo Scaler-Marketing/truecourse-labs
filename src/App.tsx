@@ -2,26 +2,18 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { DialRoot, DialStore, useDialKit, type DialConfig } from 'dialkit';
 import 'dialkit/styles.css';
 import './App.css';
-import { BlobsCanvas, type BlobsSettings } from './components/BlobsCanvas';
 import { NoiseCanvas, type NoiseSettings, type PathWaypoint } from './components/NoiseCanvas';
 
 const defaultSeed = 'TC-48291';
 
-type ShaderMode = 'bindings' | 'blobs';
 type BindingsSource = 'noise' | 'svg' | 'video';
 type SvgMode = '2d' | '3d';
-type LabSettings =
-  | { mode: 'bindings'; values: NoiseSettings }
-  | { mode: 'blobs'; values: BlobsSettings };
 
 type LabControls = {
   refresh: boolean;
   randomize: boolean;
   reset: boolean;
-  Shader: {
-    mode: string;
-    seed: string;
-  };
+  seed: string;
   Bindings?: {
     source: string;
     loadSvg?: boolean;
@@ -59,15 +51,6 @@ type LabControls = {
     extrude: number;
     animate: boolean;
   };
-  Blobs?: {
-    lineCount: number;
-    lineWidth: number;
-    cornerRadius: number;
-    angleSpread: number;
-    offsetJitter: number;
-    backgroundColor: string;
-    blobColor: string;
-  };
   Path?: {
     enabled: boolean;
     mode: string;
@@ -97,10 +80,6 @@ function randomSeed() {
   return `TC-${Math.floor(10000 + Math.random() * 89999)}`;
 }
 
-function isShaderMode(value: string): value is ShaderMode {
-  return value === 'bindings' || value === 'blobs';
-}
-
 function isBindingsSource(value: string): value is BindingsSource {
   return value === 'noise' || value === 'svg' || value === 'video';
 }
@@ -114,7 +93,6 @@ function isSvgMode(value: string): value is SvgMode {
 }
 
 function createDialConfig(
-  shaderMode: ShaderMode,
   bindingsSource: BindingsSource,
   svgNoiseEnabled: boolean,
   svgMode: SvgMode,
@@ -130,132 +108,108 @@ function createDialConfig(
     refresh: { type: 'action', label: 'Refresh' },
     randomize: { type: 'action', label: 'Randomize Seed' },
     reset: { type: 'action', label: 'Reset' },
-    Shader: {
-      mode: {
+    seed: { type: 'text', label: 'Seed', default: defaultSeed },
+    Bindings: {
+      source: {
         type: 'select',
-        default: shaderMode,
+        default: bindingsSource,
         options: [
-          { value: 'bindings', label: 'Bindings' },
-          { value: 'blobs', label: 'Blobs' },
+          { value: 'noise', label: 'Noise' },
+          { value: 'svg', label: 'SVG' },
+          { value: 'video', label: 'Video' },
         ],
       },
-      seed: { type: 'text', default: defaultSeed },
+      ...(bindingsSource === 'svg'
+        ? {
+            loadSvg: { type: 'action', label: 'Load SVG' },
+          }
+        : {}),
+      ...(bindingsSource === 'video'
+        ? {
+            loadVideo: { type: 'action', label: 'Load Video' },
+          }
+        : {}),
+      size: slider(0.42, 0.05, 1, 0.01),
+      complexity: slider(0.5, 0, 1, 0.01),
+      contrast: slider(0.58, 0, 1, 0.01),
+      brightness: slider(0.48, 0, 1, 0.01),
+      ...(bindingsSource === 'video'
+        ? {
+            videoThreshold: slider(0.5, 0, 1, 0.01),
+            videoInvert: false,
+            videoPositionX: slider(0, -1, 1, 0.01),
+            videoPositionY: slider(0, -1, 1, 0.01),
+            videoScale: slider(1, 0.1, 2.5, 0.01),
+          }
+        : {}),
+      showMap: false,
+      nodeDensity: slider(0.64, 0.05, 1, 0.01),
+      connectionDensity: slider(0.74, 0, 1, 0.01),
+      angleBias: slider(0.82, 0, 1, 0.01),
+      organicity: slider(0.42, 0, 1, 0.01),
+      nodeSize: slider(0.86, 0.2, 2.4, 0.02),
+      lineWidth: slider(0.58, 0.12, 2.4, 0.02),
+      backgroundColor: '#041426',
+      lineColor: '#7DB2FF',
+      nodeColor: '#D9EAFF',
     },
-    ...(shaderMode === 'bindings'
+    ...(bindingsSource === 'svg'
       ? {
-          Bindings: {
-            source: {
+          SVG: {
+            mode: {
               type: 'select',
-              default: bindingsSource,
+              default: svgMode,
               options: [
-                { value: 'noise', label: 'Noise' },
-                { value: 'svg', label: 'SVG' },
-                { value: 'video', label: 'Video' },
+                { value: '2d', label: '2D' },
+                { value: '3d', label: '3D' },
               ],
             },
-            ...(bindingsSource === 'svg'
+            noise: false,
+            ...(svgNoiseEnabled
               ? {
-                  loadSvg: { type: 'action', label: 'Load SVG' },
+                  size: slider(0.42, 0.05, 1, 0.01),
+                  complexity: slider(0.5, 0, 1, 0.01),
+                  contrast: slider(0.58, 0, 1, 0.01),
+                  brightness: slider(0.48, 0, 1, 0.01),
                 }
               : {}),
-            ...(bindingsSource === 'video'
+            positionX: slider(0, -1, 1, 0.01),
+            positionY: slider(0, -1, 1, 0.01),
+            scale: slider(1, 0.1, 2.5, 0.01),
+            ...(svgMode === '3d'
               ? {
-                  loadVideo: { type: 'action', label: 'Load Video' },
+                  extrude: slider(0.22, 0.02, 1.2, 0.01),
+                  animate: true,
                 }
               : {}),
-            size: slider(0.42, 0.05, 1, 0.01),
-            complexity: slider(0.5, 0, 1, 0.01),
-            contrast: slider(0.58, 0, 1, 0.01),
-            brightness: slider(0.48, 0, 1, 0.01),
-            ...(bindingsSource === 'video'
-              ? {
-                  videoThreshold: slider(0.5, 0, 1, 0.01),
-                  videoInvert: false,
-                  videoPositionX: slider(0, -1, 1, 0.01),
-                  videoPositionY: slider(0, -1, 1, 0.01),
-                  videoScale: slider(1, 0.1, 2.5, 0.01),
-                }
-              : {}),
-            showMap: false,
-            nodeDensity: slider(0.64, 0.05, 1, 0.01),
-            connectionDensity: slider(0.74, 0, 1, 0.01),
-            angleBias: slider(0.82, 0, 1, 0.01),
-            organicity: slider(0.42, 0, 1, 0.01),
-            nodeSize: slider(0.86, 0.2, 2.4, 0.02),
-            lineWidth: slider(0.58, 0.12, 2.4, 0.02),
-            backgroundColor: '#041426',
-            lineColor: '#7DB2FF',
-            nodeColor: '#D9EAFF',
-          },
-          ...(bindingsSource === 'svg'
-            ? {
-                SVG: {
-                  mode: {
-                    type: 'select',
-                    default: svgMode,
-                    options: [
-                      { value: '2d', label: '2D' },
-                      { value: '3d', label: '3D' },
-                    ],
-                  },
-                  noise: false,
-                  ...(svgNoiseEnabled
-                    ? {
-                        size: slider(0.42, 0.05, 1, 0.01),
-                        complexity: slider(0.5, 0, 1, 0.01),
-                        contrast: slider(0.58, 0, 1, 0.01),
-                        brightness: slider(0.48, 0, 1, 0.01),
-                      }
-                    : {}),
-                  positionX: slider(0, -1, 1, 0.01),
-                  positionY: slider(0, -1, 1, 0.01),
-                  scale: slider(1, 0.1, 2.5, 0.01),
-                  ...(svgMode === '3d'
-                    ? {
-                        extrude: slider(0.22, 0.02, 1.2, 0.01),
-                        animate: true,
-                      }
-                    : {}),
-                },
-              }
-            : {}),
-          Path: {
-            enabled: true,
-            ...(pathEnabled
-              ? {
-                  mode: {
-                    type: 'select',
-                    default: pathMode === 'manual' ? 'manual' : 'auto',
-                    options: [
-                      { value: 'auto', label: 'Auto' },
-                      { value: 'manual', label: 'Manual' },
-                    ],
-                  },
-                  ...(pathMode === 'manual'
-                    ? {
-                        edit: false,
-                        clearPoints: { type: 'action', label: 'Clear Points' },
-                      }
-                    : {}),
-                }
-              : {}),
-            thickness: slider(1.35, 0.4, 8, 0.1),
-            endpointSpread: slider(0.72, 0, 1, 0.01),
-            snapRadius: slider(18, 4, 80, 1),
-            color: '#FFFFFF',
           },
         }
-      : {
-          Blobs: {
-            lineCount: slider(16, 4, 28, 1),
-            lineWidth: slider(70, 16, 180, 1),
-            cornerRadius: slider(82, 0, 220, 1),
-            angleSpread: slider(0.82, 0, 1, 0.01),
-            offsetJitter: slider(0.58, 0, 1, 0.01),
-            backgroundColor: '#79BAEF',
-            blobColor: '#74DCEB',
-          },
-        }),
+      : {}),
+    Path: {
+      enabled: true,
+      ...(pathEnabled
+        ? {
+            mode: {
+              type: 'select',
+              default: pathMode === 'manual' ? 'manual' : 'auto',
+              options: [
+                { value: 'auto', label: 'Auto' },
+                { value: 'manual', label: 'Manual' },
+              ],
+            },
+            ...(pathMode === 'manual'
+              ? {
+                  edit: false,
+                  clearPoints: { type: 'action', label: 'Clear Points' },
+                }
+              : {}),
+          }
+        : {}),
+      thickness: slider(1.35, 0.4, 8, 0.1),
+      endpointSpread: slider(0.72, 0, 1, 0.01),
+      snapRadius: slider(18, 4, 80, 1),
+      color: '#FFFFFF',
+    },
     Motion: {
       enabled: false,
       loopDuration: bindingsSource === 'video'
@@ -372,37 +326,7 @@ function createBindingsSettings(
   };
 }
 
-function createBlobsSettings(
-  controls: LabControls,
-  seed: string,
-  videoExportNonce: number,
-): BlobsSettings {
-  const blobs = controls.Blobs;
-  const motion = controls.Motion;
-  const exportControls = controls.Export;
-
-  return {
-    seed,
-    lineCount: blobs?.lineCount ?? 16,
-    lineWidth: blobs?.lineWidth ?? 70,
-    cornerRadius: blobs?.cornerRadius ?? 82,
-    angleSpread: blobs?.angleSpread ?? 0.82,
-    offsetJitter: blobs?.offsetJitter ?? 0.58,
-    backgroundColor: blobs?.backgroundColor ?? '#79BAEF',
-    blobColor: blobs?.blobColor ?? '#74DCEB',
-    motionEnabled: motion.enabled,
-    loopDuration: motion.loopDuration ?? 8,
-    motionAmount: motion.amount,
-    frameRate: Math.round(motion.frameRate),
-    transparentBackground: exportControls.transparentBackground,
-    videoExportNonce,
-    width: Math.round(exportControls.width),
-    height: Math.round(exportControls.height),
-  };
-}
-
 function Lab() {
-  const [shaderMode, setShaderMode] = useState<ShaderMode>('bindings');
   const [bindingsSource, setBindingsSource] = useState<BindingsSource>('noise');
   const [svgNoiseEnabled, setSvgNoiseEnabled] = useState(false);
   const [svgMode, setSvgMode] = useState<SvgMode>('2d');
@@ -413,19 +337,15 @@ function Lab() {
   const [svgDataUrl, setSvgDataUrl] = useState<string | null>(null);
   const [videoDataUrl, setVideoDataUrl] = useState<string | null>(null);
   const [videoDuration, setVideoDuration] = useState<number | null>(null);
-  const [seedOverride, setSeedOverride] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
   const [pendingExport, setPendingExport] = useState(false);
   const [videoExportNonce, setVideoExportNonce] = useState(0);
   const [pathManualPoints, setPathManualPoints] = useState<PathWaypoint[]>([]);
   const config = useMemo(
-    () => createDialConfig(shaderMode, bindingsSource, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode),
-    [bindingsSource, pathEnabled, pathMode, shaderMode, svgMode, svgNoiseEnabled, videoDuration],
+    () => createDialConfig(bindingsSource, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode),
+    [bindingsSource, pathEnabled, pathMode, svgMode, svgNoiseEnabled, videoDuration],
   );
-  const panelName = useMemo(() => {
-    if (shaderMode === 'bindings') return `Noise Field / ${bindingsSource}${bindingsSource === 'video' ? ` / ${videoDuration ?? 'pending'}` : ''}`;
-    return 'Noise Field / blobs';
-  }, [bindingsSource, shaderMode, videoDuration]);
+  const panelName = 'TrueCourse Patterns';
 
   const controls = useDialKit(
     panelName,
@@ -434,7 +354,9 @@ function Lab() {
       onAction: (action) => {
         if (action === 'refresh') setNonce((value) => value + 1);
         if (action === 'randomize') {
-          setSeedOverride(randomSeed());
+          const nextSeed = randomSeed();
+          const panel = DialStore.getPanels().find((item) => item.name === panelName);
+          if (panel) DialStore.updateValue(panel.id, 'seed', nextSeed);
           setNonce((value) => value + 1);
         }
         if (action === 'reset') window.location.reload();
@@ -446,13 +368,6 @@ function Lab() {
       },
     },
   ) as unknown as LabControls;
-
-  useEffect(() => {
-    const nextMode = controls.Shader.mode;
-    if (isShaderMode(nextMode) && nextMode !== shaderMode) {
-      setShaderMode(nextMode);
-    }
-  }, [controls.Shader.mode, shaderMode]);
 
   useEffect(() => {
     const nextSource = controls.Bindings?.source;
@@ -510,12 +425,10 @@ function Lab() {
     wrapper.removeAttribute('title');
   }, [bindingsSource, panelName, videoDuration]);
 
-  const settings: LabSettings = useMemo(() => {
-    const seed = `${seedOverride ?? controls.Shader.seed}:${nonce}`;
-    return shaderMode === 'blobs'
-      ? { mode: 'blobs', values: createBlobsSettings(controls, seed, videoExportNonce) }
-      : { mode: 'bindings', values: createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, videoDuration, pathManualPoints) };
-  }, [controls, nonce, pathManualPoints, seedOverride, shaderMode, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
+  const settings = useMemo<NoiseSettings>(() => {
+    const seed = `${controls.seed ?? defaultSeed}:${nonce}`;
+    return createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, videoDuration, pathManualPoints);
+  }, [controls, nonce, pathManualPoints, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
 
   const debouncedSettings = useDebouncedValue(settings, 35);
 
@@ -525,7 +438,7 @@ function Lab() {
     if (!canvas) return;
     const link = document.createElement('a');
     link.href = canvas.toDataURL('image/png');
-    link.download = `truecourse-${debouncedSettings.mode}-${debouncedSettings.values.seed.replace(/[^a-z0-9-]/gi, '-')}.png`;
+    link.download = `truecourse-bindings-${debouncedSettings.seed.replace(/[^a-z0-9-]/gi, '-')}.png`;
     link.click();
     setPendingExport(false);
   }, [debouncedSettings, pendingExport]);
@@ -568,15 +481,11 @@ function Lab() {
         }}
       />
       <section className="work-area">
-        {debouncedSettings.mode === 'blobs'
-          ? <BlobsCanvas settings={debouncedSettings.values} />
-          : (
-              <NoiseCanvas
-                settings={debouncedSettings.values}
-                pathEditEnabled={controls.Path?.edit ?? false}
-                onPathPointsChange={setPathManualPoints}
-              />
-            )}
+        <NoiseCanvas
+          settings={debouncedSettings}
+          pathEditEnabled={controls.Path?.edit ?? false}
+          onPathPointsChange={setPathManualPoints}
+        />
       </section>
 
       <aside className="control-rail">
