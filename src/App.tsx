@@ -2,12 +2,29 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { DialRoot, DialStore, useDialKit, type DialConfig } from 'dialkit';
 import 'dialkit/styles.css';
 import './App.css';
-import { NoiseCanvas, type NoiseSettings, type PathWaypoint } from './components/NoiseCanvas';
+import { NoiseCanvas, type GradientControlChange, type NoiseSettings, type PathWaypoint } from './components/NoiseCanvas';
 
 const defaultSeed = 'TC-48291';
+const minGradientStops = 2;
+const maxGradientStops = 6;
+const defaultGradientStops = [
+  { color: '#7DB2FF', position: 0 },
+  { color: '#D9EAFF', position: 0.35 },
+  { color: '#8FFFD2', position: 0.72 },
+  { color: '#FFFFFF', position: 1 },
+  { color: '#B6A3FF', position: 0.55 },
+  { color: '#FFE08A', position: 0.9 },
+] as const;
 
 type BindingsSource = 'noise' | 'svg' | 'video';
 type SvgMode = '2d' | '3d';
+type GradientStopIndex = 1 | 2 | 3 | 4 | 5 | 6;
+
+type GradientStopControlFields = {
+  [K in GradientStopIndex as `gradientStop${K}Color`]?: string;
+} & {
+  [K in GradientStopIndex as `gradientStop${K}Position`]?: number;
+};
 
 type LabControls = {
   refresh: boolean;
@@ -34,9 +51,15 @@ type LabControls = {
     organicity: number;
     nodeSize: number;
     lineWidth: number;
+  };
+  Color?: GradientStopControlFields & {
     backgroundColor: string;
-    lineColor: string;
-    nodeColor: string;
+    foregroundColor?: string;
+    colorMode: string;
+    gradientType?: string;
+    toggleGradientEdit?: boolean;
+    addStop?: boolean;
+    removeStop?: boolean;
   };
   SVG?: {
     mode: string;
@@ -92,6 +115,19 @@ function isSvgMode(value: string): value is SvgMode {
   return value === '2d' || value === '3d';
 }
 
+function createGradientStopControls(count: number) {
+  const controls: Record<string, unknown> = {};
+  for (let index = 0; index < count; index += 1) {
+    const stop = defaultGradientStops[index];
+    const labelNumber = index + 1;
+    controls[`gradientStop${labelNumber}Color`] = stop.color;
+    if (index > 0 && index < count - 1) {
+      controls[`gradientStop${labelNumber}Position`] = slider(stop.position, 0, 1, 0.01);
+    }
+  }
+  return controls;
+}
+
 function createDialConfig(
   bindingsSource: BindingsSource,
   svgNoiseEnabled: boolean,
@@ -99,6 +135,10 @@ function createDialConfig(
   videoDuration: number | null,
   pathEnabled: boolean,
   pathMode: string,
+  gradientStopCount: number,
+  gradientEditEnabled: boolean,
+  colorMode: 'solid' | 'gradient',
+  gradientType: 'linear' | 'radial',
 ): DialConfig {
   const effectiveLoopDuration = bindingsSource === 'video'
     ? Math.max(0.25, videoDuration ?? 8)
@@ -149,9 +189,35 @@ function createDialConfig(
       organicity: slider(0.42, 0, 1, 0.01),
       nodeSize: slider(0.86, 0.2, 2.4, 0.02),
       lineWidth: slider(0.58, 0.12, 2.4, 0.02),
+    },
+    Color: {
       backgroundColor: '#041426',
-      lineColor: '#7DB2FF',
-      nodeColor: '#D9EAFF',
+      colorMode: {
+        type: 'select',
+        default: colorMode,
+        options: [
+          { value: 'solid', label: 'Solid' },
+          { value: 'gradient', label: 'Gradient' },
+        ],
+      },
+      ...(colorMode === 'solid'
+        ? {
+            foregroundColor: '#7DB2FF',
+          }
+        : {
+            gradientType: {
+              type: 'select',
+              default: gradientType,
+              options: [
+                { value: 'linear', label: 'Linear' },
+                { value: 'radial', label: 'Radial' },
+              ],
+            },
+            toggleGradientEdit: { type: 'action', label: gradientEditEnabled ? 'Hide Editor' : 'Edit Gradient' },
+            addStop: { type: 'action', label: 'Add Stop' },
+            removeStop: { type: 'action', label: 'Remove Stop' },
+            ...createGradientStopControls(gradientStopCount),
+          }),
     },
     ...(bindingsSource === 'svg'
       ? {
@@ -268,12 +334,26 @@ function createBindingsSettings(
   videoDataUrl: string | null,
   videoDuration: number | null,
   pathManualPoints: PathWaypoint[],
+  gradientStopCount: number,
+  gradientEditEnabled: boolean,
+  colorMode: 'solid' | 'gradient',
+  gradientType: 'linear' | 'radial',
+  gradientVector: { startX: number; startY: number; endX: number; endY: number },
 ): NoiseSettings {
   const bindings = controls.Bindings;
+  const color = controls.Color;
   const svg = controls.SVG;
   const path = controls.Path;
   const motion = controls.Motion;
   const exportControls = controls.Export;
+  const gradientStops = Array.from({ length: gradientStopCount }, (_, index) => {
+    const number = index + 1 as GradientStopIndex;
+    const defaults = defaultGradientStops[index];
+    return {
+      color: color?.[`gradientStop${number}Color`] ?? defaults.color,
+      position: index === 0 ? 0 : index === gradientStopCount - 1 ? 1 : color?.[`gradientStop${number}Position`] ?? defaults.position,
+    };
+  });
 
   return {
     seed,
@@ -303,9 +383,18 @@ function createBindingsSettings(
     organicity: bindings?.organicity ?? 0.42,
     nodeSize: bindings?.nodeSize ?? 0.86,
     lineWidth: bindings?.lineWidth ?? 0.58,
-    backgroundColor: bindings?.backgroundColor ?? '#041426',
-    lineColor: bindings?.lineColor ?? '#7DB2FF',
-    nodeColor: bindings?.nodeColor ?? '#D9EAFF',
+    backgroundColor: color?.backgroundColor ?? '#041426',
+    foregroundColor: color?.foregroundColor ?? '#7DB2FF',
+    colorMode,
+    gradientType,
+    gradientEdit: gradientEditEnabled,
+    gradientAngle: Math.atan2(gradientVector.endY - gradientVector.startY, gradientVector.endX - gradientVector.startX) * 180 / Math.PI,
+    gradientStartX: gradientVector.startX,
+    gradientStartY: gradientVector.startY,
+    gradientEndX: gradientVector.endX,
+    gradientEndY: gradientVector.endY,
+    gradientRadius: Math.hypot(gradientVector.endX - gradientVector.startX, gradientVector.endY - gradientVector.startY),
+    gradientStops,
     pathEnabled: path?.enabled ?? true,
     pathMode: path?.mode === 'manual' ? 'manual' : 'auto',
     pathManualPoints,
@@ -341,9 +430,19 @@ function Lab() {
   const [pendingExport, setPendingExport] = useState(false);
   const [videoExportNonce, setVideoExportNonce] = useState(0);
   const [pathManualPoints, setPathManualPoints] = useState<PathWaypoint[]>([]);
+  const [gradientStopCount, setGradientStopCount] = useState(4);
+  const [gradientEditEnabled, setGradientEditEnabled] = useState(false);
+  const [colorMode, setColorMode] = useState<'solid' | 'gradient'>('solid');
+  const [gradientType, setGradientType] = useState<'linear' | 'radial'>('linear');
+  const [gradientVector, setGradientVector] = useState({
+    startX: 0,
+    startY: 0.5,
+    endX: 1,
+    endY: 0.5,
+  });
   const config = useMemo(
-    () => createDialConfig(bindingsSource, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode),
-    [bindingsSource, pathEnabled, pathMode, svgMode, svgNoiseEnabled, videoDuration],
+    () => createDialConfig(bindingsSource, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode, gradientStopCount, gradientEditEnabled, colorMode, gradientType),
+    [bindingsSource, colorMode, gradientEditEnabled, gradientStopCount, gradientType, pathEnabled, pathMode, svgMode, svgNoiseEnabled, videoDuration],
   );
   const panelName = 'TrueCourse Patterns';
 
@@ -362,6 +461,9 @@ function Lab() {
         if (action === 'reset') window.location.reload();
         if (action === 'Bindings.loadSvg' || action === 'loadSvg') svgInputRef.current?.click();
         if (action === 'Bindings.loadVideo' || action === 'loadVideo') videoInputRef.current?.click();
+        if (action === 'Color.toggleGradientEdit' || action === 'toggleGradientEdit') setGradientEditEnabled((value) => !value);
+        if (action === 'Color.addStop' || action === 'addStop') setGradientStopCount((value) => Math.min(maxGradientStops, value + 1));
+        if (action === 'Color.removeStop' || action === 'removeStop') setGradientStopCount((value) => Math.max(minGradientStops, value - 1));
         if (action === 'Path.clearPoints' || action === 'clearPoints') setPathManualPoints([]);
         if (action === 'Export.exportPng' || action === 'exportPng') setPendingExport(true);
         if (action === 'Export.exportMp4' || action === 'exportMp4') setVideoExportNonce((value) => value + 1);
@@ -369,12 +471,39 @@ function Lab() {
     },
   ) as unknown as LabControls;
 
+  const updateGradientControl = (change: GradientControlChange) => {
+    if (change.type === 'gradient-start') {
+      setGradientVector((value) => ({ ...value, startX: change.x, startY: change.y }));
+      return;
+    }
+    if (change.type === 'gradient-end') {
+      setGradientVector((value) => ({ ...value, endX: change.x, endY: change.y }));
+      return;
+    }
+    const panel = DialStore.getPanels().find((item) => item.name === panelName);
+    if (!panel) return;
+    DialStore.updateValue(panel.id, `Color.${change.key}`, Number(change.value.toFixed(3)));
+  };
+
   useEffect(() => {
     const nextSource = controls.Bindings?.source;
     if (nextSource && isBindingsSource(nextSource) && nextSource !== bindingsSource) {
       setBindingsSource(nextSource);
     }
   }, [bindingsSource, controls.Bindings?.source]);
+
+  useEffect(() => {
+    const nextColorMode = controls.Color?.colorMode === 'gradient' ? 'gradient' : 'solid';
+    if (nextColorMode !== colorMode) {
+      setColorMode(nextColorMode);
+      if (nextColorMode === 'solid') setGradientEditEnabled(false);
+    }
+  }, [colorMode, controls.Color?.colorMode]);
+
+  useEffect(() => {
+    const nextGradientType = controls.Color?.gradientType === 'radial' ? 'radial' : 'linear';
+    if (nextGradientType !== gradientType) setGradientType(nextGradientType);
+  }, [controls.Color?.gradientType, gradientType]);
 
   useEffect(() => {
     const nextSvgNoise = controls.SVG?.noise ?? false;
@@ -427,8 +556,8 @@ function Lab() {
 
   const settings = useMemo<NoiseSettings>(() => {
     const seed = `${controls.seed ?? defaultSeed}:${nonce}`;
-    return createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, videoDuration, pathManualPoints);
-  }, [controls, nonce, pathManualPoints, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
+    return createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, videoDuration, pathManualPoints, gradientStopCount, gradientEditEnabled, colorMode, gradientType, gradientVector);
+  }, [colorMode, controls, gradientEditEnabled, gradientStopCount, gradientType, gradientVector, nonce, pathManualPoints, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
 
   const debouncedSettings = useDebouncedValue(settings, 35);
 
@@ -485,6 +614,7 @@ function Lab() {
           settings={debouncedSettings}
           pathEditEnabled={controls.Path?.edit ?? false}
           onPathPointsChange={setPathManualPoints}
+          onGradientControlChange={updateGradientControl}
         />
       </section>
 

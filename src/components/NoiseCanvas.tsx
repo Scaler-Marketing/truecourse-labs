@@ -17,6 +17,24 @@ export type PathWaypoint = {
   y: number;
 };
 
+export type GradientStop = {
+  color: string;
+  position: number;
+};
+
+export type GradientControlKey =
+  | 'gradientStop1Position'
+  | 'gradientStop2Position'
+  | 'gradientStop3Position'
+  | 'gradientStop4Position'
+  | 'gradientStop5Position'
+  | 'gradientStop6Position';
+
+export type GradientControlChange =
+  | { type: 'stop-position'; key: GradientControlKey; value: number }
+  | { type: 'gradient-start'; x: number; y: number }
+  | { type: 'gradient-end'; x: number; y: number };
+
 export type NoiseSettings = {
   seed: string;
   source: 'noise' | 'svg' | 'video';
@@ -46,8 +64,17 @@ export type NoiseSettings = {
   nodeSize: number;
   lineWidth: number;
   backgroundColor: string;
-  lineColor: string;
-  nodeColor: string;
+  foregroundColor: string;
+  colorMode: 'solid' | 'gradient';
+  gradientType: 'linear' | 'radial';
+  gradientEdit: boolean;
+  gradientAngle: number;
+  gradientStartX: number;
+  gradientStartY: number;
+  gradientEndX: number;
+  gradientEndY: number;
+  gradientRadius: number;
+  gradientStops: GradientStop[];
   pathEnabled: boolean;
   pathMode: 'auto' | 'manual';
   pathManualPoints: PathWaypoint[];
@@ -289,6 +316,43 @@ function hexToRgba(hex: string, alpha: number) {
     (value & 255) / 255,
     alpha,
   ] as const;
+}
+
+function clamp01(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function shaderGradientStops(settings: NoiseSettings) {
+  return settings.gradientStops
+    .map((stop) => ({
+      color: hexToRgba(stop.color, 1),
+      position: clamp01(stop.position),
+    }))
+    .sort((a, b) => a.position - b.position);
+}
+
+function applyPaintUniforms(
+  material: THREE.ShaderMaterial,
+  settings: NoiseSettings,
+  color: readonly number[],
+  useGradient: boolean,
+) {
+  const uniforms = material.uniforms;
+  const stops = shaderGradientStops(settings);
+  const fallbackStop = stops[stops.length - 1] ?? { color: hexToRgba(settings.foregroundColor, 1), position: 1 };
+  const paddedStops = Array.from({ length: 6 }, (_, index) => stops[index] ?? fallbackStop);
+  uniforms.u_color.value.set(color[0], color[1], color[2], color[3]);
+  uniforms.u_colorMode.value = useGradient && settings.colorMode === 'gradient' ? 1 : 0;
+  uniforms.u_gradientType.value = settings.gradientType === 'radial' ? 1 : 0;
+  uniforms.u_gradientStart.value.set(clamp01(settings.gradientStartX), clamp01(settings.gradientStartY));
+  uniforms.u_gradientEnd.value.set(clamp01(settings.gradientEndX), clamp01(settings.gradientEndY));
+  uniforms.u_canvasSize.value.set(Math.max(1, settings.width), Math.max(1, settings.height));
+  uniforms.u_stopCount.value = Math.max(2, Math.min(6, stops.length));
+  uniforms.u_stopPositions.value = paddedStops.map((stop) => stop.position);
+  uniforms.u_stopColors.value.forEach((stopColor: THREE.Vector4, index: number) => {
+    const stop = paddedStops[index];
+    stopColor.set(stop.color[0], stop.color[1], stop.color[2], 1);
+  });
 }
 
 function sampleNoiseField(seed: number, x: number, y: number, settings: NoiseSettings) {
@@ -879,29 +943,90 @@ function createGlBundle(canvas: HTMLCanvasElement): GlBundle | null {
 
   const scene = new THREE.Scene();
   const camera = new THREE.OrthographicCamera(0, 1, 0, 1, -10, 10);
+  const gradientUniforms = () => ({
+    u_color: { value: new THREE.Vector4(1, 1, 1, 1) },
+    u_colorMode: { value: 0 },
+    u_gradientType: { value: 0 },
+    u_gradientStart: { value: new THREE.Vector2(0, 0.5) },
+    u_gradientEnd: { value: new THREE.Vector2(1, 0.5) },
+    u_canvasSize: { value: new THREE.Vector2(1, 1) },
+    u_stopCount: { value: 4 },
+    u_stopPositions: { value: [0, 0.35, 0.72, 1, 1, 1] },
+    u_stopColors: {
+      value: [
+        new THREE.Vector4(1, 1, 1, 1),
+        new THREE.Vector4(1, 1, 1, 1),
+        new THREE.Vector4(1, 1, 1, 1),
+        new THREE.Vector4(1, 1, 1, 1),
+        new THREE.Vector4(1, 1, 1, 1),
+        new THREE.Vector4(1, 1, 1, 1),
+      ],
+    },
+  });
+  const gradientFragment = `
+    uniform vec4 u_color;
+    uniform float u_colorMode;
+    uniform float u_gradientType;
+    uniform vec2 u_gradientStart;
+    uniform vec2 u_gradientEnd;
+    uniform vec2 u_canvasSize;
+    uniform int u_stopCount;
+    uniform float u_stopPositions[6];
+    uniform vec4 u_stopColors[6];
+    varying vec2 v_position;
+
+    vec3 rampColor(float t) {
+      vec3 color = u_stopColors[0].rgb;
+      for (int i = 1; i < 6; i++) {
+        if (i >= u_stopCount) break;
+        float previousPosition = u_stopPositions[i - 1];
+        float nextPosition = max(u_stopPositions[i], previousPosition + 0.0001);
+        vec3 previousColor = u_stopColors[i - 1].rgb;
+        vec3 nextColor = u_stopColors[i].rgb;
+        color = mix(previousColor, nextColor, smoothstep(previousPosition, nextPosition, t));
+        if (t <= nextPosition) break;
+      }
+      return color;
+    }
+
+    vec3 paintColor() {
+      if (u_colorMode < 0.5) return u_color.rgb;
+      vec2 uv = v_position / u_canvasSize;
+      float t = 0.0;
+      vec2 gradientVector = u_gradientEnd - u_gradientStart;
+      float gradientLength = max(0.0001, length(gradientVector));
+      if (u_gradientType < 0.5) {
+        vec2 direction = gradientVector / gradientLength;
+        t = dot(uv - u_gradientStart, direction) / gradientLength;
+      } else {
+        t = distance(uv, u_gradientStart) / gradientLength;
+      }
+      return rampColor(clamp(t, 0.0, 1.0));
+    }
+  `;
 
   const lineMaterial = new THREE.ShaderMaterial({
     transparent: true,
     depthTest: false,
     depthWrite: false,
     side: THREE.DoubleSide,
-    uniforms: {
-      u_color: { value: new THREE.Vector4(1, 1, 1, 1) },
-    },
+    uniforms: gradientUniforms(),
     vertexShader: `
     attribute float a_alpha;
     varying float v_alpha;
+    varying vec2 v_position;
     void main() {
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       v_alpha = a_alpha;
+      v_position = position.xy;
     }
     `,
     fragmentShader: `
     precision mediump float;
-    uniform vec4 u_color;
     varying float v_alpha;
+    ${gradientFragment}
     void main() {
-      gl_FragColor = vec4(u_color.rgb, u_color.a * v_alpha);
+      gl_FragColor = vec4(paintColor(), u_color.a * v_alpha);
     }
     `,
   });
@@ -911,28 +1036,30 @@ function createGlBundle(canvas: HTMLCanvasElement): GlBundle | null {
     depthTest: false,
     depthWrite: false,
     uniforms: {
-      u_color: { value: new THREE.Vector4(1, 1, 1, 1) },
+      ...gradientUniforms(),
       u_pointSize: { value: 1 },
     },
     vertexShader: `
     attribute float a_alpha;
     uniform float u_pointSize;
     varying float v_alpha;
+    varying vec2 v_position;
     void main() {
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       gl_PointSize = u_pointSize;
       v_alpha = a_alpha;
+      v_position = position.xy;
     }
     `,
     fragmentShader: `
     precision mediump float;
-    uniform vec4 u_color;
     varying float v_alpha;
+    ${gradientFragment}
     void main() {
       vec2 p = gl_PointCoord - 0.5;
       float d = length(p);
       float edge = smoothstep(0.5, 0.32, d);
-      gl_FragColor = vec4(u_color.rgb, u_color.a * v_alpha * edge);
+      gl_FragColor = vec4(paintColor(), u_color.a * v_alpha * edge);
     }
     `,
   });
@@ -952,6 +1079,8 @@ function drawVertices(
   alphas: number[],
   mode: 'lines' | 'points',
   color: readonly number[],
+  settings: NoiseSettings,
+  useGradient = false,
   size?: number,
 ) {
   if (!vertices.length) return;
@@ -1012,7 +1141,7 @@ function drawVertices(
   }
 
   const material = mode === 'points' ? bundle.pointMaterial : bundle.lineMaterial;
-  material.uniforms.u_color.value.set(color[0], color[1], color[2], color[3]);
+  applyPaintUniforms(material, settings, color, useGradient);
   if (mode === 'points' && size !== undefined) {
     bundle.pointMaterial.uniforms.u_pointSize.value = size;
   }
@@ -1310,12 +1439,12 @@ function renderWebgl(
   bundle.renderer.clear();
 
   const frame = getCachedFrameGeometry(frameCacheRef, pool, settings, phase, mask);
-  drawVertices(bundle, frame.lineVertices, frame.lineAlphas, 'lines', hexToRgba(settings.lineColor, 0.9), settings.lineWidth);
-  drawVertices(bundle, frame.stubVertices, frame.stubAlphas, 'lines', hexToRgba(settings.lineColor, 0.72), settings.lineWidth * 0.82);
-  drawVertices(bundle, frame.pathVertices, frame.pathAlphas, 'lines', hexToRgba(settings.pathColor, 0.96), settings.pathThickness);
-  drawVertices(bundle, frame.pathPointVertices, frame.pathPointAlphas, 'points', hexToRgba(settings.pathColor, 1), Math.max(5.5, settings.pathThickness * 2.6));
-  drawVertices(bundle, frame.nodeVertices, frame.nodeAlphas, 'points', hexToRgba(settings.nodeColor, 1), Math.max(1.2, settings.nodeSize * 2.3));
-  drawVertices(bundle, frame.stubNodeVertices, frame.stubNodeAlphas, 'points', hexToRgba(settings.nodeColor, 0.88), Math.max(1, settings.nodeSize * 1.45));
+  drawVertices(bundle, frame.lineVertices, frame.lineAlphas, 'lines', hexToRgba(settings.foregroundColor, 0.9), settings, true, settings.lineWidth);
+  drawVertices(bundle, frame.stubVertices, frame.stubAlphas, 'lines', hexToRgba(settings.foregroundColor, 0.72), settings, true, settings.lineWidth * 0.82);
+  drawVertices(bundle, frame.pathVertices, frame.pathAlphas, 'lines', hexToRgba(settings.pathColor, 0.96), settings, false, settings.pathThickness);
+  drawVertices(bundle, frame.pathPointVertices, frame.pathPointAlphas, 'points', hexToRgba(settings.pathColor, 1), settings, false, Math.max(5.5, settings.pathThickness * 2.6));
+  drawVertices(bundle, frame.nodeVertices, frame.nodeAlphas, 'points', hexToRgba(settings.foregroundColor, 1), settings, true, Math.max(1.2, settings.nodeSize * 2.3));
+  drawVertices(bundle, frame.stubNodeVertices, frame.stubNodeAlphas, 'points', hexToRgba(settings.foregroundColor, 0.88), settings, true, Math.max(1, settings.nodeSize * 1.45));
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -1740,9 +1869,49 @@ type NoiseCanvasProps = {
   settings: NoiseSettings;
   pathEditEnabled?: boolean;
   onPathPointsChange?: Dispatch<SetStateAction<PathWaypoint[]>>;
+  onGradientControlChange?: (change: GradientControlChange) => void;
 };
 
-export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsChange }: NoiseCanvasProps) {
+function gradientHandlePoints(settings: NoiseSettings) {
+  const start = {
+    x: clamp01(settings.gradientStartX),
+    y: clamp01(settings.gradientStartY),
+  };
+  const end = {
+    x: clamp01(settings.gradientEndX),
+    y: clamp01(settings.gradientEndY),
+  };
+  const vector = {
+    x: end.x - start.x,
+    y: end.y - start.y,
+  };
+  const stopKeys: GradientControlKey[] = [
+    'gradientStop1Position',
+    'gradientStop2Position',
+    'gradientStop3Position',
+    'gradientStop4Position',
+    'gradientStop5Position',
+    'gradientStop6Position',
+  ];
+  const stops = settings.gradientStops.map((stop, index) => {
+    const position = clamp01(stop.position);
+    const isStartStop = index === 0;
+    const isEndStop = index === settings.gradientStops.length - 1;
+    const handleX = isStartStop ? start.x : isEndStop ? end.x : start.x + vector.x * position;
+    const handleY = isStartStop ? start.y : isEndStop ? end.y : start.y + vector.y * position;
+    return {
+      key: stopKeys[index],
+      color: stop.color,
+      isStartStop,
+      isEndStop,
+      x: clamp01(handleX),
+      y: clamp01(handleY),
+    };
+  });
+  return { start, end, stops };
+}
+
+export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsChange, onGradientControlChange }: NoiseCanvasProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
@@ -1757,6 +1926,8 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
   const [orbitRevision, setOrbitRevision] = useState(0);
   const [previewSize, setPreviewSize] = useState<PreviewSize | null>(null);
   const sourceMaskKey = createSourceMaskKey(settings);
+  const showGradientEditor = settings.colorMode === 'gradient' && settings.gradientEdit && Boolean(onGradientControlChange);
+  const gradientHandles = gradientHandlePoints(settings);
 
   latestSettingsRef.current = settings;
 
@@ -1806,6 +1977,60 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
   const handlePathContextMenu = (event: ReactMouseEvent<HTMLCanvasElement>) => {
     if (!pathEditEnabled || settings.pathMode !== 'manual') return;
     event.preventDefault();
+  };
+
+  const updateGradientFromPointer = (stop: ReturnType<typeof gradientHandlePoints>['stops'][number], event: PointerEvent | ReactPointerEvent<HTMLElement>) => {
+    if (!onGradientControlChange) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const bounds = canvas.getBoundingClientRect();
+    const uv = {
+      x: clamp01((event.clientX - bounds.left) / Math.max(1, bounds.width)),
+      y: clamp01((event.clientY - bounds.top) / Math.max(1, bounds.height)),
+    };
+
+    if (stop.isStartStop) {
+      onGradientControlChange({ type: 'gradient-start', x: uv.x, y: uv.y });
+      return;
+    }
+
+    if (stop.isEndStop) {
+      onGradientControlChange({ type: 'gradient-end', x: uv.x, y: uv.y });
+      return;
+    }
+
+    const start = {
+      x: clamp01(settings.gradientStartX),
+      y: clamp01(settings.gradientStartY),
+    };
+    const end = {
+      x: clamp01(settings.gradientEndX),
+      y: clamp01(settings.gradientEndY),
+    };
+    const vx = end.x - start.x;
+    const vy = end.y - start.y;
+    const lengthSq = Math.max(0.0001, vx * vx + vy * vy);
+    const nextPosition = ((uv.x - start.x) * vx + (uv.y - start.y) * vy) / lengthSq;
+    onGradientControlChange({ type: 'stop-position', key: stop.key, value: clamp01(nextPosition) });
+  };
+
+  const handleGradientPointerDown = (stop: ReturnType<typeof gradientHandlePoints>['stops'][number], event: ReactPointerEvent<HTMLElement>) => {
+    if (!showGradientEditor) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+    updateGradientFromPointer(stop, event);
+
+    const handleMove = (moveEvent: PointerEvent) => updateGradientFromPointer(stop, moveEvent);
+    const handleUp = (upEvent: PointerEvent) => {
+      target.releasePointerCapture(upEvent.pointerId);
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+    };
+
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp, { once: true });
   };
 
   useEffect(() => {
@@ -2012,6 +2237,32 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
           style={pathEditEnabled && settings.pathMode === 'manual' ? { cursor: 'crosshair' } : undefined}
         />
         <canvas ref={overlayRef} className="noise-map-canvas" aria-hidden="true" hidden />
+        {showGradientEditor ? (
+          <div className="gradient-editor" aria-label="Gradient editor">
+            <svg className="gradient-axis" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+              <line
+                x1={gradientHandles.start.x * 100}
+                y1={gradientHandles.start.y * 100}
+                x2={gradientHandles.end.x * 100}
+                y2={gradientHandles.end.y * 100}
+              />
+            </svg>
+            {gradientHandles.stops.map((stop, index) => (
+              <button
+                key={stop.key}
+                type="button"
+                className={`gradient-handle gradient-stop-handle${stop.isStartStop || stop.isEndStop ? ' gradient-endpoint-stop' : ''}`}
+                style={{
+                  left: `${stop.x * 100}%`,
+                  top: `${stop.y * 100}%`,
+                  backgroundColor: stop.color,
+                }}
+                title={stop.isStartStop ? `Gradient stop ${index + 1} start` : stop.isEndStop ? `Gradient stop ${index + 1} end` : `Gradient stop ${index + 1}`}
+                onPointerDown={(event) => handleGradientPointerDown(stop, event)}
+              />
+            ))}
+          </div>
+        ) : null}
       </div>
     </div>
   );
