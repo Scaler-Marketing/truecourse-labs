@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { DialRoot, DialStore, useDialKit, type DialConfig } from 'dialkit';
 import 'dialkit/styles.css';
 import './App.css';
-import { NoiseCanvas, type GradientControlChange, type NoiseSettings, type PathWaypoint } from './components/NoiseCanvas';
+import { NoiseCanvas, type GradientControlChange, type NoiseSettings, type PathWaypoint, type TerrainCameraControlChange } from './components/NoiseCanvas';
 
 const defaultSeed = 'TC-48291';
 const minGradientStops = 2;
@@ -39,8 +39,7 @@ type LabControls = {
     renderMode?: string;
     terrainHeight?: number;
     terrainDepth?: number;
-    terrainPitch?: number;
-    terrainDistance?: number;
+    terrainCoverage?: number;
     terrainGlow?: number;
     size: number;
     complexity: number;
@@ -58,6 +57,15 @@ type LabControls = {
     organicity: number;
     nodeSize: number;
     lineWidth: number;
+  };
+  Camera?: {
+    positionX: number;
+    positionY: number;
+    positionZ: number;
+    targetX: number;
+    targetY: number;
+    targetZ: number;
+    fov: number;
   };
   Color?: GradientStopControlFields & {
     backgroundColor: string;
@@ -177,8 +185,7 @@ function createDialConfig(
       },
       terrainHeight: slider(0.55, 0, 1, 0.01),
       terrainDepth: slider(1, 0.4, 2, 0.01),
-      terrainPitch: slider(0.42, 0, 1, 0.01),
-      terrainDistance: slider(0.72, 0.2, 1.4, 0.01),
+      terrainCoverage: slider(1, 0.75, 2.5, 0.01),
       terrainGlow: slider(0.72, 0, 1, 0.01),
       ...(bindingsSource === 'svg'
         ? {
@@ -215,6 +222,15 @@ function createDialConfig(
       organicity: slider(0.42, 0, 1, 0.01),
       nodeSize: slider(0.86, 0.2, 2.4, 0.02),
       lineWidth: slider(0.58, 0.12, 2.4, 0.02),
+    },
+    Camera: {
+      positionX: slider(0, -1.5, 1.5, 0.01),
+      positionY: slider(0.34, -0.2, 1.25, 0.01),
+      positionZ: slider(0.94, -0.5, 1.8, 0.01),
+      targetX: slider(0, -1.5, 1.5, 0.01),
+      targetY: slider(0.02, -0.35, 0.85, 0.01),
+      targetZ: slider(-0.18, -1.2, 1.2, 0.01),
+      fov: slider(42, 20, 75, 1),
     },
     Color: {
       backgroundColor: '#041426',
@@ -369,6 +385,7 @@ function createBindingsSettings(
 ): NoiseSettings {
   const bindings = controls.Bindings;
   const color = controls.Color;
+  const camera = controls.Camera;
   const svg = controls.SVG;
   const path = controls.Path;
   const motion = controls.Motion;
@@ -403,9 +420,15 @@ function createBindingsSettings(
     videoScale: bindings?.videoScale ?? 1,
     terrainHeight: bindings?.terrainHeight ?? 0.55,
     terrainDepth: bindings?.terrainDepth ?? 1,
-    terrainPitch: bindings?.terrainPitch ?? 0.42,
-    terrainDistance: bindings?.terrainDistance ?? 0.72,
+    terrainCoverage: bindings?.terrainCoverage ?? 1,
     terrainGlow: bindings?.terrainGlow ?? 0.72,
+    terrainCameraPositionX: camera?.positionX ?? 0,
+    terrainCameraPositionY: camera?.positionY ?? 0.34,
+    terrainCameraPositionZ: camera?.positionZ ?? 0.94,
+    terrainCameraTargetX: camera?.targetX ?? 0,
+    terrainCameraTargetY: camera?.targetY ?? 0.02,
+    terrainCameraTargetZ: camera?.targetZ ?? -0.18,
+    terrainCameraFov: camera?.fov ?? 42,
     size: bindings?.size ?? svg?.size ?? 0.42,
     complexity: bindings?.complexity ?? svg?.complexity ?? 0.5,
     contrast: bindings?.contrast ?? svg?.contrast ?? 0.58,
@@ -508,6 +531,11 @@ function Lab() {
     },
   ) as unknown as LabControls;
 
+  const updateTerrainCameraControl = (change: TerrainCameraControlChange) => {
+    const panel = DialStore.getPanels().find((item) => item.name === panelName);
+    if (!panel) return;
+    DialStore.updateValue(panel.id, `Camera.${change.key}`, Number(change.value.toFixed(3)));
+  };
   const updateGradientControl = (change: GradientControlChange) => {
     if (change.type === 'gradient-start') {
       setGradientVector((value) => ({ ...value, startX: change.x, startY: change.y }));
@@ -668,6 +696,7 @@ function Lab() {
           pathEditEnabled={controls.Path?.edit ?? false}
           onPathPointsChange={setPathManualPoints}
           onGradientControlChange={updateGradientControl}
+          onTerrainCameraChange={updateTerrainCameraControl}
         />
       </section>
 

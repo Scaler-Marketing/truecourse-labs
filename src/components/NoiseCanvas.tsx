@@ -35,6 +35,20 @@ export type GradientControlChange =
   | { type: 'gradient-start'; x: number; y: number }
   | { type: 'gradient-end'; x: number; y: number };
 
+export type TerrainCameraControlKey =
+  | 'positionX'
+  | 'positionY'
+  | 'positionZ'
+  | 'targetX'
+  | 'targetY'
+  | 'targetZ'
+  | 'fov';
+
+export type TerrainCameraControlChange = {
+  key: TerrainCameraControlKey;
+  value: number;
+};
+
 export type NoiseSettings = {
   seed: string;
   source: 'noise' | 'svg' | 'video' | 'image';
@@ -56,9 +70,15 @@ export type NoiseSettings = {
   videoScale: number;
   terrainHeight: number;
   terrainDepth: number;
-  terrainPitch: number;
-  terrainDistance: number;
+  terrainCoverage: number;
   terrainGlow: number;
+  terrainCameraPositionX: number;
+  terrainCameraPositionY: number;
+  terrainCameraPositionZ: number;
+  terrainCameraTargetX: number;
+  terrainCameraTargetY: number;
+  terrainCameraTargetZ: number;
+  terrainCameraFov: number;
   size: number;
   complexity: number;
   contrast: number;
@@ -1472,9 +1492,116 @@ type TerrainPoint = {
   x: number;
   y: number;
   z: number;
+  sourceX: number;
+  sourceY: number;
   depth: number;
   weight: number;
 };
+
+function terrainBaseWorldSize(settings: NoiseSettings) {
+  const depth = 920 * settings.terrainDepth;
+  return {
+    depth,
+    width: depth * (settings.width / Math.max(1, settings.height)),
+  };
+}
+
+function terrainWorldSize(settings: NoiseSettings) {
+  const base = terrainBaseWorldSize(settings);
+  const coverage = Math.max(0.1, settings.terrainCoverage);
+  return {
+    depth: base.depth * coverage,
+    width: base.width * coverage,
+  };
+}
+
+function terrainCameraVectors(settings: NoiseSettings) {
+  const world = terrainBaseWorldSize(settings);
+  return {
+    world,
+    position: new THREE.Vector3(
+      settings.terrainCameraPositionX * world.width * 0.5,
+      settings.terrainCameraPositionY * world.depth,
+      settings.terrainCameraPositionZ * world.depth,
+    ),
+    target: new THREE.Vector3(
+      settings.terrainCameraTargetX * world.width * 0.5,
+      settings.terrainCameraTargetY * world.depth,
+      settings.terrainCameraTargetZ * world.depth,
+    ),
+  };
+}
+
+function applyTerrainCameraSettings(camera: THREE.PerspectiveCamera, settings: NoiseSettings) {
+  const { position, target } = terrainCameraVectors(settings);
+  camera.fov = settings.terrainCameraFov;
+  camera.near = 1;
+  camera.far = 5000;
+  camera.position.copy(position);
+  camera.lookAt(target);
+  camera.updateProjectionMatrix();
+  return target;
+}
+
+function terrainCameraValueFromWorld(settings: NoiseSettings, position: THREE.Vector3, target: THREE.Vector3) {
+  const world = terrainBaseWorldSize(settings);
+  return {
+    positionX: position.x / Math.max(1, world.width * 0.5),
+    positionY: position.y / Math.max(1, world.depth),
+    positionZ: position.z / Math.max(1, world.depth),
+    targetX: target.x / Math.max(1, world.width * 0.5),
+    targetY: target.y / Math.max(1, world.depth),
+    targetZ: target.z / Math.max(1, world.depth),
+  };
+}
+function terrainNodeScreenPosition(
+  node: PoolNode,
+  settings: NoiseSettings,
+  mask: FieldMask | null,
+  camera: THREE.PerspectiveCamera,
+  bounds: DOMRect,
+) {
+  const point = terrainPoint(hashSeed(settings.seed), node.x, node.y, settings, mask, 0);
+  const projected = new THREE.Vector3(point.x, point.y, point.z).project(camera);
+  if (projected.z < -1 || projected.z > 1) return null;
+  return {
+    x: (projected.x * 0.5 + 0.5) * bounds.width,
+    y: (-projected.y * 0.5 + 0.5) * bounds.height,
+  };
+}
+
+function nearestTerrainNodeToPointer(
+  pool: PatternPool,
+  settings: NoiseSettings,
+  mask: FieldMask | null,
+  camera: THREE.PerspectiveCamera,
+  bounds: DOMRect,
+  pointerX: number,
+  pointerY: number,
+) {
+  const seed = hashSeed(settings.seed);
+  const useSvgNoiseField = settings.source === 'svg' && shouldUseNoiseInsideSvg(settings);
+  const threshold = isMaskedSource(settings)
+    ? (useSvgNoiseField ? 0.26 : 0.5)
+    : 0.38 - settings.nodeDensity * 0.16;
+  let closest: PoolNode | null = null;
+  let closestDistance = Infinity;
+
+  for (const node of pool.nodes) {
+    const weight = terrainWeight(seed, node.x, node.y, settings, mask, 0);
+    const isVisible = (weight > threshold && node.gate < 0.2 + weight * 0.9) || pool.pathPointIds.has(node.id);
+    if (!isVisible) continue;
+    const screen = terrainNodeScreenPosition(node, settings, mask, camera, bounds);
+    if (!screen) continue;
+    const distance = Math.hypot(screen.x - pointerX, screen.y - pointerY);
+    if (distance < closestDistance) {
+      closestDistance = distance;
+      closest = node;
+    }
+  }
+
+  return { node: closest, distance: closestDistance };
+}
 
 function terrainWeight(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null, phase: number) {
   if (settings.source === 'video' || settings.source === 'image') return sampleMask(mask, x, y);
@@ -1482,8 +1609,7 @@ function terrainWeight(seed: number, x: number, y: number, settings: NoiseSettin
 }
 
 function terrainPoint(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null, phase: number): TerrainPoint {
-  const worldDepth = 920 * settings.terrainDepth;
-  const worldWidth = worldDepth * (settings.width / Math.max(1, settings.height));
+  const { depth: worldDepth, width: worldWidth } = terrainWorldSize(settings);
   const depth = y / Math.max(1, settings.height);
   const weight = terrainWeight(seed, x, y, settings, mask, phase);
   const ridge = Math.pow(Math.max(0, weight), 1.65);
@@ -1491,40 +1617,69 @@ function terrainPoint(seed: number, x: number, y: number, settings: NoiseSetting
     x: (x / Math.max(1, settings.width) - 0.5) * worldWidth,
     y: (ridge - 0.28) * 280 * settings.terrainHeight,
     z: (depth - 0.5) * worldDepth,
+    sourceX: x,
+    sourceY: y,
     depth,
     weight,
   };
 }
 
-function terrainColor(settings: NoiseSettings, depth: number, weight: number, boost = 0) {
-  const stops = shaderGradientStops(settings);
-  const t = clamp01(depth * 0.88 + weight * 0.12);
-  let color = hexToRgba(settings.foregroundColor, 1);
-  if (settings.colorMode === 'gradient' && stops.length) {
-    let previous = stops[0];
-    let next = stops[stops.length - 1];
-    for (let index = 1; index < stops.length; index += 1) {
-      if (t <= stops[index].position) {
-        previous = stops[index - 1];
-        next = stops[index];
-        break;
-      }
-    }
-    const span = Math.max(0.0001, next.position - previous.position);
-    const mix = smoothstep(clamp01((t - previous.position) / span));
-    color = [
-      previous.color[0] + (next.color[0] - previous.color[0]) * mix,
-      previous.color[1] + (next.color[1] - previous.color[1]) * mix,
-      previous.color[2] + (next.color[2] - previous.color[2]) * mix,
-      1,
-    ];
+function terrainGradientT(settings: NoiseSettings, x: number, y: number) {
+  const uvX = x / Math.max(1, settings.width);
+  const uvY = y / Math.max(1, settings.height);
+  const startX = clamp01(settings.gradientStartX);
+  const startY = clamp01(settings.gradientStartY);
+  const endX = clamp01(settings.gradientEndX);
+  const endY = clamp01(settings.gradientEndY);
+  const vectorX = endX - startX;
+  const vectorY = endY - startY;
+  const length = Math.max(0.0001, Math.hypot(vectorX, vectorY));
+
+  if (settings.gradientType === 'radial') {
+    return clamp01(Math.hypot(uvX - startX, uvY - startY) / length);
   }
+
+  const directionX = vectorX / length;
+  const directionY = vectorY / length;
+  return clamp01(((uvX - startX) * directionX + (uvY - startY) * directionY) / length);
+}
+
+function rampColorAt(settings: NoiseSettings, t: number) {
+  const stops = shaderGradientStops(settings);
+  if (settings.colorMode !== 'gradient' || !stops.length) return hexToRgba(settings.foregroundColor, 1);
+  let previous = stops[0];
+  let next = stops[stops.length - 1];
+  for (let index = 1; index < stops.length; index += 1) {
+    if (t <= stops[index].position) {
+      previous = stops[index - 1];
+      next = stops[index];
+      break;
+    }
+  }
+  const mix = smoothstep(clamp01((t - previous.position) / Math.max(0.0001, next.position - previous.position)));
+  return [
+    previous.color[0] + (next.color[0] - previous.color[0]) * mix,
+    previous.color[1] + (next.color[1] - previous.color[1]) * mix,
+    previous.color[2] + (next.color[2] - previous.color[2]) * mix,
+    1,
+  ] as const;
+}
+
+function boostedRgb(color: readonly number[], weight: number, boost = 0) {
   const lift = 0.22 + weight * 0.78 + boost;
   return [
     Math.min(1, color[0] * lift),
     Math.min(1, color[1] * lift),
     Math.min(1, color[2] * lift),
   ];
+}
+
+function terrainColor(settings: NoiseSettings, x: number, y: number, weight: number, boost = 0) {
+  return boostedRgb(rampColorAt(settings, terrainGradientT(settings, x, y)), weight, boost);
+}
+
+function terrainSolidColor(color: string, weight: number, boost = 0) {
+  return boostedRgb(hexToRgba(color, 1), weight, boost);
 }
 
 function pushTerrainPolyline(
@@ -1538,6 +1693,7 @@ function pushTerrainPolyline(
   phase: number,
   organicity: number,
   boost = 0,
+  colorOverride?: string,
 ) {
   const control = curveControlPoint(a, b, organicity);
   const samples = 5;
@@ -1552,8 +1708,12 @@ function pushTerrainPolyline(
     if (previous) {
       positions.push(previous.x, previous.y, previous.z, current.x, current.y, current.z);
       colors.push(
-        ...terrainColor(settings, previous.depth, previous.weight, boost),
-        ...terrainColor(settings, current.depth, current.weight, boost),
+        ...(colorOverride
+          ? terrainSolidColor(colorOverride, previous.weight, boost)
+          : terrainColor(settings, previous.sourceX, previous.sourceY, previous.weight, boost)),
+        ...(colorOverride
+          ? terrainSolidColor(colorOverride, current.weight, boost)
+          : terrainColor(settings, point.x, point.y, current.weight, boost)),
       );
     }
     previous = current;
@@ -1593,14 +1753,8 @@ function renderTerrainWebgl(
     ? bundle.camera
     : new THREE.PerspectiveCamera(42, aspect, 1, 5000);
   bundle.camera = camera;
-  const worldDepth = 920 * settings.terrainDepth;
   camera.aspect = aspect;
-  camera.fov = 38 + settings.terrainPitch * 10;
-  camera.near = 1;
-  camera.far = 5000;
-  camera.position.set(0, worldDepth * (0.16 + settings.terrainPitch * 0.42), worldDepth * (0.42 + settings.terrainDistance * 0.72));
-  camera.lookAt(0, 20 * settings.terrainHeight, -worldDepth * 0.18);
-  camera.updateProjectionMatrix();
+  applyTerrainCameraSettings(camera, settings);
 
   const seed = hashSeed(settings.seed);
   const useSvgNoiseField = settings.source === 'svg' && shouldUseNoiseInsideSvg(settings);
@@ -1625,7 +1779,7 @@ function renderTerrainWebgl(
     if (active[node.id]) {
       const point = terrainPoint(seed, node.x, node.y, settings, mask, phase);
       pointPositions.push(point.x, point.y, point.z);
-      pointColors.push(...terrainColor(settings, point.depth, point.weight, settings.terrainGlow * 0.25));
+      pointColors.push(...terrainColor(settings, node.x, node.y, point.weight, settings.terrainGlow * 0.25));
     }
   }
 
@@ -1641,7 +1795,7 @@ function renderTerrainWebgl(
   }
 
   for (const connection of pool.pathConnections) {
-    pushTerrainPolyline(pathPositions, pathColors, seed, connection.a, connection.b, settings, mask, phase, settings.organicity * 0.9, 0.55 + settings.terrainGlow * 0.35);
+    pushTerrainPolyline(pathPositions, pathColors, seed, connection.a, connection.b, settings, mask, phase, settings.organicity * 0.9, 0.55 + settings.terrainGlow * 0.35, settings.pathColor);
   }
 
   for (const nodeId of pool.pathPointIds) {
@@ -1649,7 +1803,7 @@ function renderTerrainWebgl(
     if (!node) continue;
     const point = terrainPoint(seed, node.x, node.y, settings, mask, phase);
     pathPointPositions.push(point.x, point.y + 2, point.z);
-    pathPointColors.push(...terrainColor(settings, point.depth, point.weight, 0.75));
+    pathPointColors.push(...terrainSolidColor(settings.pathColor, point.weight, 0.75));
   }
 
   const makeLineObject = (positions: number[], colors: number[], opacity: number) => {
@@ -2197,6 +2351,7 @@ type NoiseCanvasProps = {
   pathEditEnabled?: boolean;
   onPathPointsChange?: Dispatch<SetStateAction<PathWaypoint[]>>;
   onGradientControlChange?: (change: GradientControlChange) => void;
+  onTerrainCameraChange?: (change: TerrainCameraControlChange) => void;
 };
 
 function gradientHandlePoints(settings: NoiseSettings) {
@@ -2238,7 +2393,7 @@ function gradientHandlePoints(settings: NoiseSettings) {
   return { start, end, stops };
 }
 
-export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsChange, onGradientControlChange }: NoiseCanvasProps) {
+export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsChange, onGradientControlChange, onTerrainCameraChange }: NoiseCanvasProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
@@ -2248,6 +2403,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
   const frameCacheRef = useRef<FrameGeometryCache | null>(null);
   const orbitRef = useRef<SvgOrbit | null>(null);
   const latestSettingsRef = useRef(settings);
+  const terrainCameraChangeRef = useRef(onTerrainCameraChange);
   const lastVideoNonceRef = useRef(settings.videoExportNonce);
   const [sourceMask, setSourceMask] = useState<FieldMask | null>(null);
   const [orbitRevision, setOrbitRevision] = useState(0);
@@ -2257,6 +2413,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
   const gradientHandles = gradientHandlePoints(settings);
 
   latestSettingsRef.current = settings;
+  terrainCameraChangeRef.current = onTerrainCameraChange;
 
   const handlePathPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (!pathEditEnabled || settings.pathMode !== 'manual' || !settings.pathEnabled || !onPathPointsChange) return;
@@ -2266,10 +2423,27 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
 
     event.preventDefault();
     const bounds = canvas.getBoundingClientRect();
-    const x = ((event.clientX - bounds.left) / Math.max(1, bounds.width)) * settings.width;
-    const y = ((event.clientY - bounds.top) / Math.max(1, bounds.height)) * settings.height;
-    const closest = nearestNodeToWaypoint(pool.nodes, { x: x / settings.width, y: y / settings.height }, settings);
-    if (!closest || Math.hypot(closest.x - x, closest.y - y) > settings.pathSnapRadius) return;
+    const pointerX = event.clientX - bounds.left;
+    const pointerY = event.clientY - bounds.top;
+    let closest: PoolNode | null = null;
+
+    if (settings.renderMode === 'terrain') {
+      const camera = glRef.current?.camera;
+      if (!(camera instanceof THREE.PerspectiveCamera)) return;
+      const pick = nearestTerrainNodeToPointer(pool, settings, sourceMask, camera, bounds, pointerX, pointerY);
+      const screenSnapRadius = Math.max(
+        8,
+        settings.pathSnapRadius * Math.max(bounds.width / Math.max(1, settings.width), bounds.height / Math.max(1, settings.height)),
+      );
+      if (!pick.node || pick.distance > screenSnapRadius) return;
+      closest = pick.node;
+    } else {
+      const x = (pointerX / Math.max(1, bounds.width)) * settings.width;
+      const y = (pointerY / Math.max(1, bounds.height)) * settings.height;
+      closest = nearestNodeToWaypoint(pool.nodes, { x: x / settings.width, y: y / settings.height }, settings);
+      if (!closest || Math.hypot(closest.x - x, closest.y - y) > settings.pathSnapRadius) return;
+    }
+
     const waypoint = {
       x: Math.max(0, Math.min(1, closest.x / settings.width)),
       y: Math.max(0, Math.min(1, closest.y / settings.height)),
@@ -2366,6 +2540,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
     glRef.current = createGlBundle(canvas);
 
     return () => {
+      if (glRef.current) disposeTerrainObjects(glRef.current.scene);
       glRef.current?.lineMaterial.dispose();
       glRef.current?.pointMaterial.dispose();
       glRef.current?.renderer.dispose();
@@ -2412,7 +2587,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || settings.source !== 'svg' || settings.svgMode !== '3d') return undefined;
+    if (!canvas || settings.renderMode === 'terrain' || settings.source !== 'svg' || settings.svgMode !== '3d') return undefined;
 
     const camera = new THREE.PerspectiveCamera(36, settings.width / settings.height, 0.1, 10000);
     camera.position.copy(orbitRef.current?.position ?? new THREE.Vector3(0, 0, Math.max(settings.width, settings.height) * 1.6));
@@ -2440,8 +2615,49 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
       controls.removeEventListener('change', updateOrbit);
       controls.dispose();
     };
-  }, [settings.height, settings.source, settings.svgMode, settings.width]);
+  }, [settings.height, settings.renderMode, settings.source, settings.svgMode, settings.width]);
 
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const bundle = glRef.current;
+    if (!canvas || !bundle || settings.renderMode !== 'terrain') return undefined;
+
+    const camera = bundle.camera instanceof THREE.PerspectiveCamera
+      ? bundle.camera
+      : new THREE.PerspectiveCamera(settings.terrainCameraFov, settings.width / settings.height, 1, 5000);
+    bundle.camera = camera;
+    camera.aspect = settings.width / Math.max(1, settings.height);
+    const target = applyTerrainCameraSettings(camera, settings);
+
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = false;
+    controls.enablePan = true;
+    controls.screenSpacePanning = true;
+    controls.target.copy(target);
+    controls.update();
+
+    const updateField = (key: TerrainCameraControlKey, value: number, current: number) => {
+      if (Math.abs(value - current) <= 0.002) return;
+      terrainCameraChangeRef.current?.({ key, value });
+    };
+
+    const updateCameraControls = () => {
+      const currentSettings = latestSettingsRef.current;
+      const values = terrainCameraValueFromWorld(currentSettings, camera.position, controls.target);
+      updateField('positionX', values.positionX, currentSettings.terrainCameraPositionX);
+      updateField('positionY', values.positionY, currentSettings.terrainCameraPositionY);
+      updateField('positionZ', values.positionZ, currentSettings.terrainCameraPositionZ);
+      updateField('targetX', values.targetX, currentSettings.terrainCameraTargetX);
+      updateField('targetY', values.targetY, currentSettings.terrainCameraTargetY);
+      updateField('targetZ', values.targetZ, currentSettings.terrainCameraTargetZ);
+    };
+
+    controls.addEventListener('change', updateCameraControls);
+    return () => {
+      controls.removeEventListener('change', updateCameraControls);
+      controls.dispose();
+    };
+  }, [settings]);
   useEffect(() => {
     let cancelled = false;
     const maskSettings = latestSettingsRef.current;
