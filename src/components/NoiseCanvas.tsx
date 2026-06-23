@@ -37,7 +37,7 @@ export type GradientControlChange =
 
 export type NoiseSettings = {
   seed: string;
-  source: 'noise' | 'svg' | 'video';
+  source: 'noise' | 'svg' | 'video' | 'image';
   svgDataUrl: string | null;
   svgMode: '2d' | '3d';
   svgNoiseEnabled: boolean;
@@ -47,6 +47,7 @@ export type NoiseSettings = {
   svgExtrude: number;
   svgAnimate: boolean;
   videoDataUrl: string | null;
+  imageDataUrl: string | null;
   videoThreshold: number;
   videoInvert: boolean;
   videoPositionX: number;
@@ -184,6 +185,15 @@ type VideoMaskCache = {
 };
 
 let videoMaskCache: VideoMaskCache | null = null;
+
+type ImageMaskCache = {
+  src: string;
+  image: HTMLImageElement;
+  canvas: HTMLCanvasElement;
+  context: CanvasRenderingContext2D;
+};
+
+let imageMaskCache: ImageMaskCache | null = null;
 
 function cloneOrbit(orbit: SvgOrbit | null): SvgOrbit | null {
   if (!orbit) return null;
@@ -387,7 +397,7 @@ function shouldUseNoiseInsideSvg(settings: NoiseSettings) {
 }
 
 function isMaskedSource(settings: NoiseSettings) {
-  return settings.source === 'svg' || settings.source === 'video';
+  return settings.source === 'svg' || settings.source === 'video' || settings.source === 'image';
 }
 
 function sampleSourceField(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null, phase = 0) {
@@ -396,7 +406,7 @@ function sampleSourceField(seed: number, x: number, y: number, settings: NoiseSe
     if (!shouldUseNoiseInsideSvg(settings)) return maskValue;
     return maskValue * sampleNoise(seed, x, y, settings, phase);
   }
-  if (settings.source === 'video') return sampleMask(mask, x, y);
+  if (settings.source === 'video' || settings.source === 'image') return sampleMask(mask, x, y);
   return sampleNoise(seed, x, y, settings, phase);
 }
 
@@ -588,10 +598,10 @@ function createSourceMaskKey(settings: NoiseSettings) {
       height: settings.height,
     });
   }
-  if (settings.source === 'video') {
+  if (settings.source === 'video' || settings.source === 'image') {
     return JSON.stringify({
       source: settings.source,
-      videoDataUrl: resourceSignature(settings.videoDataUrl),
+      mediaDataUrl: resourceSignature(settings.source === 'video' ? settings.videoDataUrl : settings.imageDataUrl),
       videoThreshold: settings.videoThreshold,
       videoInvert: settings.videoInvert,
       videoPositionX: settings.videoPositionX,
@@ -1282,7 +1292,7 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   const active = new Uint8Array(pool.nodes.length);
   const connected = new Uint8Array(pool.nodes.length);
   const useSvgNoiseField = settings.source === 'svg' && shouldUseNoiseInsideSvg(settings);
-  const useVideoMask = settings.source === 'video';
+  const useMediaMask = settings.source === 'video' || settings.source === 'image';
   const threshold = isMaskedSource(settings)
     ? (useSvgNoiseField ? 0.26 : 0.5)
     : 0.38 - settings.nodeDensity * 0.16;
@@ -1300,7 +1310,7 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   const stubNodeAlphas: number[] = [];
 
   for (const node of pool.nodes) {
-    const weight = useVideoMask
+    const weight = useMediaMask
       ? sampleMask(mask, node.x, node.y)
       : morphValue(node.baseWeight, node.morphWeights, settings, phase);
     weights[node.id] = weight;
@@ -1312,7 +1322,7 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
     if (!active[edge.a.id] || !active[edge.b.id]) continue;
     const midpointX = (edge.a.x + edge.b.x) * 0.5;
     const midpointY = (edge.a.y + edge.b.y) * 0.5;
-    const midpointWeight = useVideoMask
+    const midpointWeight = useMediaMask
       ? sampleMask(mask, midpointX, midpointY)
       : morphValue(edge.baseWeight, edge.morphWeights, settings, phase);
     if (midpointWeight < (isMaskedSource(settings) ? (useSvgNoiseField ? 0.24 : 0.5) : 0.22)) continue;
@@ -1376,7 +1386,7 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
       y: node.y + Math.sin(node.stubAngle) * node.stubLength,
     };
     if (end.x <= 0 || end.x >= settings.width || end.y <= 0 || end.y >= settings.height) continue;
-    const stubWeight = useVideoMask
+    const stubWeight = useMediaMask
       ? sampleMask(mask, end.x, end.y)
       : morphValue(node.stubBaseWeight, node.stubMorphWeights, settings, phase);
     if (stubWeight < (isMaskedSource(settings) ? 0.58 : 0.18)) continue;
@@ -1552,6 +1562,10 @@ function disposeVideoMaskCache() {
   videoMaskCache.video.removeAttribute('src');
   videoMaskCache.video.load();
   videoMaskCache = null;
+}
+
+function disposeImageMaskCache() {
+  imageMaskCache = null;
 }
 
 async function getSvg3dMaskCache(settings: NoiseSettings): Promise<Svg3dMaskCache | null> {
@@ -1769,9 +1783,66 @@ async function createVideoMask(settings: NoiseSettings, phase = 0, playback: 'se
   return imageDataToMask(cache.context, settings.width, settings.height);
 }
 
+async function getImageMaskCache(settings: NoiseSettings): Promise<ImageMaskCache | null> {
+  if (!settings.imageDataUrl) return null;
+  if (imageMaskCache?.src === settings.imageDataUrl) return imageMaskCache;
+
+  disposeImageMaskCache();
+
+  const image = await loadImage(settings.imageDataUrl);
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  if (!context) return null;
+
+  imageMaskCache = {
+    src: settings.imageDataUrl,
+    image,
+    canvas,
+    context,
+  };
+
+  return imageMaskCache;
+}
+
+async function createImageMask(settings: NoiseSettings): Promise<FieldMask | null> {
+  if (settings.source !== 'image' || !settings.imageDataUrl) return null;
+  const cache = await getImageMaskCache(settings);
+  if (!cache) return null;
+
+  if (cache.canvas.width !== settings.width) cache.canvas.width = settings.width;
+  if (cache.canvas.height !== settings.height) cache.canvas.height = settings.height;
+
+  const sourceWidth = cache.image.naturalWidth || settings.width;
+  const sourceHeight = cache.image.naturalHeight || settings.height;
+  const fit = Math.min(settings.width / sourceWidth, settings.height / sourceHeight) * settings.videoScale;
+  const drawWidth = sourceWidth * fit;
+  const drawHeight = sourceHeight * fit;
+  const centerX = settings.width * 0.5 + settings.videoPositionX * settings.width * 0.5;
+  const centerY = settings.height * 0.5 + settings.videoPositionY * settings.height * 0.5;
+
+  cache.context.fillStyle = '#000000';
+  cache.context.fillRect(0, 0, settings.width, settings.height);
+  cache.context.drawImage(cache.image, centerX - drawWidth * 0.5, centerY - drawHeight * 0.5, drawWidth, drawHeight);
+
+  const image = cache.context.getImageData(0, 0, settings.width, settings.height);
+  const threshold = Math.round(Math.max(0, Math.min(1, settings.videoThreshold)) * 255);
+  for (let index = 0; index < image.data.length; index += 4) {
+    const luminance = image.data[index] * 0.2126 + image.data[index + 1] * 0.7152 + image.data[index + 2] * 0.0722;
+    const active = settings.videoInvert ? luminance < threshold : luminance >= threshold;
+    const value = active ? 255 : 0;
+    image.data[index] = value;
+    image.data[index + 1] = value;
+    image.data[index + 2] = value;
+    image.data[index + 3] = 255;
+  }
+  cache.context.putImageData(image, 0, 0);
+
+  return imageDataToMask(cache.context, settings.width, settings.height);
+}
 async function createSourceMask(settings: NoiseSettings, phase = 0, orbit: SvgOrbit | null = null, videoPlayback: 'seek' | 'play' = 'seek'): Promise<FieldMask | null> {
   if (settings.source === 'svg') return createSvgMask(settings, phase, orbit);
   if (settings.source === 'video') return createVideoMask(settings, phase, videoPlayback);
+  if (settings.source === 'image') return createImageMask(settings);
   return null;
 }
 
@@ -2044,6 +2115,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
       glRef.current?.renderer.dispose();
       disposeSvg3dMaskCache();
       disposeVideoMaskCache();
+      disposeImageMaskCache();
       glRef.current = null;
     };
   }, []);
@@ -2117,10 +2189,11 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
   useEffect(() => {
     let cancelled = false;
     const maskSettings = latestSettingsRef.current;
-    const hasSourceFile = (maskSettings.source === 'svg' && maskSettings.svgDataUrl) || (maskSettings.source === 'video' && maskSettings.videoDataUrl);
+    const hasSourceFile = (maskSettings.source === 'svg' && maskSettings.svgDataUrl) || (maskSettings.source === 'video' && maskSettings.videoDataUrl) || (maskSettings.source === 'image' && maskSettings.imageDataUrl);
     if (!isMaskedSource(maskSettings) || !hasSourceFile) {
       disposeSvg3dMaskCache();
       disposeVideoMaskCache();
+      disposeImageMaskCache();
       setSourceMask(null);
       return () => {
         cancelled = true;
@@ -2128,6 +2201,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
     }
     if (maskSettings.svgMode !== '3d') disposeSvg3dMaskCache();
     if (maskSettings.source !== 'video') disposeVideoMaskCache();
+    if (maskSettings.source !== 'image') disposeImageMaskCache();
 
     const videoPlayback = maskSettings.source === 'video' && maskSettings.motionEnabled ? 'play' : 'seek';
     void createSourceMask(maskSettings, 0, orbitRef.current, videoPlayback).then((mask) => {

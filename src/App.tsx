@@ -16,7 +16,7 @@ const defaultGradientStops = [
   { color: '#FFE08A', position: 0.9 },
 ] as const;
 
-type BindingsSource = 'noise' | 'svg' | 'video';
+type BindingsSource = 'noise' | 'svg' | 'video' | 'image';
 type SvgMode = '2d' | '3d';
 type GradientStopIndex = 1 | 2 | 3 | 4 | 5 | 6;
 
@@ -35,6 +35,7 @@ type LabControls = {
     source: string;
     loadSvg?: boolean;
     loadVideo?: boolean;
+    loadImage?: boolean;
     size: number;
     complexity: number;
     contrast: number;
@@ -104,7 +105,7 @@ function randomSeed() {
 }
 
 function isBindingsSource(value: string): value is BindingsSource {
-  return value === 'noise' || value === 'svg' || value === 'video';
+  return value === 'noise' || value === 'svg' || value === 'video' || value === 'image';
 }
 
 function slider(defaultValue: number, min: number, max: number, step: number): [number, number, number, number] {
@@ -157,6 +158,7 @@ function createDialConfig(
           { value: 'noise', label: 'Noise' },
           { value: 'svg', label: 'SVG' },
           { value: 'video', label: 'Video' },
+          { value: 'image', label: 'Image' },
         ],
       },
       ...(bindingsSource === 'svg'
@@ -169,11 +171,16 @@ function createDialConfig(
             loadVideo: { type: 'action', label: 'Load Video' },
           }
         : {}),
+      ...(bindingsSource === 'image'
+        ? {
+            loadImage: { type: 'action', label: 'Load Image' },
+          }
+        : {}),
       size: slider(0.42, 0.05, 1, 0.01),
       complexity: slider(0.5, 0, 1, 0.01),
       contrast: slider(0.58, 0, 1, 0.01),
       brightness: slider(0.48, 0, 1, 0.01),
-      ...(bindingsSource === 'video'
+      ...(bindingsSource === 'video' || bindingsSource === 'image'
         ? {
             videoThreshold: slider(0.5, 0, 1, 0.01),
             videoInvert: false,
@@ -332,6 +339,7 @@ function createBindingsSettings(
   videoExportNonce: number,
   svgDataUrl: string | null,
   videoDataUrl: string | null,
+  imageDataUrl: string | null,
   videoDuration: number | null,
   pathManualPoints: PathWaypoint[],
   gradientStopCount: number,
@@ -357,7 +365,7 @@ function createBindingsSettings(
 
   return {
     seed,
-    source: bindings?.source === 'svg' ? 'svg' : bindings?.source === 'video' ? 'video' : 'noise',
+    source: bindings?.source === 'svg' ? 'svg' : bindings?.source === 'video' ? 'video' : bindings?.source === 'image' ? 'image' : 'noise',
     svgDataUrl,
     svgMode: svg?.mode === '3d' ? '3d' : '2d',
     svgNoiseEnabled: svg?.noise ?? false,
@@ -367,6 +375,7 @@ function createBindingsSettings(
     svgExtrude: svg?.extrude ?? 0.22,
     svgAnimate: svg?.animate ?? true,
     videoDataUrl,
+    imageDataUrl,
     videoThreshold: bindings?.videoThreshold ?? 0.5,
     videoInvert: bindings?.videoInvert ?? false,
     videoPositionX: bindings?.videoPositionX ?? 0,
@@ -423,8 +432,10 @@ function Lab() {
   const [pathMode, setPathMode] = useState<'auto' | 'manual'>('auto');
   const svgInputRef = useRef<HTMLInputElement | null>(null);
   const videoInputRef = useRef<HTMLInputElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
   const [svgDataUrl, setSvgDataUrl] = useState<string | null>(null);
   const [videoDataUrl, setVideoDataUrl] = useState<string | null>(null);
+  const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
   const [videoDuration, setVideoDuration] = useState<number | null>(null);
   const [nonce, setNonce] = useState(0);
   const [pendingExport, setPendingExport] = useState(false);
@@ -461,6 +472,7 @@ function Lab() {
         if (action === 'reset') window.location.reload();
         if (action === 'Bindings.loadSvg' || action === 'loadSvg') svgInputRef.current?.click();
         if (action === 'Bindings.loadVideo' || action === 'loadVideo') videoInputRef.current?.click();
+        if (action === 'Bindings.loadImage' || action === 'loadImage') imageInputRef.current?.click();
         if (action === 'Color.toggleGradientEdit' || action === 'toggleGradientEdit') setGradientEditEnabled((value) => !value);
         if (action === 'Color.addStop' || action === 'addStop') setGradientStopCount((value) => Math.min(maxGradientStops, value + 1));
         if (action === 'Color.removeStop' || action === 'removeStop') setGradientStopCount((value) => Math.max(minGradientStops, value - 1));
@@ -556,8 +568,8 @@ function Lab() {
 
   const settings = useMemo<NoiseSettings>(() => {
     const seed = `${controls.seed ?? defaultSeed}:${nonce}`;
-    return createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, videoDuration, pathManualPoints, gradientStopCount, gradientEditEnabled, colorMode, gradientType, gradientVector);
-  }, [colorMode, controls, gradientEditEnabled, gradientStopCount, gradientType, gradientVector, nonce, pathManualPoints, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
+    return createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, imageDataUrl, videoDuration, pathManualPoints, gradientStopCount, gradientEditEnabled, colorMode, gradientType, gradientVector);
+  }, [colorMode, controls, gradientEditEnabled, gradientStopCount, gradientType, gradientVector, imageDataUrl, nonce, pathManualPoints, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
 
   const debouncedSettings = useDebouncedValue(settings, 35);
 
@@ -605,6 +617,22 @@ function Lab() {
             setVideoDataUrl(reader.result);
             setVideoDuration(null);
             void readVideoDuration(reader.result).then(setVideoDuration);
+          };
+          reader.readAsDataURL(file);
+        }}
+      />
+      <input
+        ref={imageInputRef}
+        className="file-input"
+        type="file"
+        accept="image/jpeg,image/png,.jpg,.jpeg,.png"
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = '';
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = () => {
+            if (typeof reader.result === 'string') setImageDataUrl(reader.result);
           };
           reader.readAsDataURL(file);
         }}
