@@ -36,6 +36,12 @@ type LabControls = {
     loadSvg?: boolean;
     loadVideo?: boolean;
     loadImage?: boolean;
+    renderMode?: string;
+    terrainHeight?: number;
+    terrainDepth?: number;
+    terrainPitch?: number;
+    terrainDistance?: number;
+    terrainGlow?: number;
     size: number;
     complexity: number;
     contrast: number;
@@ -161,6 +167,19 @@ function createDialConfig(
           { value: 'image', label: 'Image' },
         ],
       },
+      renderMode: {
+        type: 'select',
+        default: 'flat',
+        options: [
+          { value: 'flat', label: 'Flat' },
+          { value: 'terrain', label: 'Terrain' },
+        ],
+      },
+      terrainHeight: slider(0.55, 0, 1, 0.01),
+      terrainDepth: slider(1, 0.4, 2, 0.01),
+      terrainPitch: slider(0.42, 0, 1, 0.01),
+      terrainDistance: slider(0.72, 0.2, 1.4, 0.01),
+      terrainGlow: slider(0.72, 0, 1, 0.01),
       ...(bindingsSource === 'svg'
         ? {
             loadSvg: { type: 'action', label: 'Load SVG' },
@@ -366,6 +385,7 @@ function createBindingsSettings(
   return {
     seed,
     source: bindings?.source === 'svg' ? 'svg' : bindings?.source === 'video' ? 'video' : bindings?.source === 'image' ? 'image' : 'noise',
+    renderMode: bindings?.renderMode === 'terrain' ? 'terrain' : 'flat',
     svgDataUrl,
     svgMode: svg?.mode === '3d' ? '3d' : '2d',
     svgNoiseEnabled: svg?.noise ?? false,
@@ -381,6 +401,11 @@ function createBindingsSettings(
     videoPositionX: bindings?.videoPositionX ?? 0,
     videoPositionY: bindings?.videoPositionY ?? 0,
     videoScale: bindings?.videoScale ?? 1,
+    terrainHeight: bindings?.terrainHeight ?? 0.55,
+    terrainDepth: bindings?.terrainDepth ?? 1,
+    terrainPitch: bindings?.terrainPitch ?? 0.42,
+    terrainDistance: bindings?.terrainDistance ?? 0.72,
+    terrainGlow: bindings?.terrainGlow ?? 0.72,
     size: bindings?.size ?? svg?.size ?? 0.42,
     complexity: bindings?.complexity ?? svg?.complexity ?? 0.5,
     contrast: bindings?.contrast ?? svg?.contrast ?? 0.58,

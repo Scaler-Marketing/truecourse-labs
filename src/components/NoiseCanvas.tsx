@@ -38,6 +38,7 @@ export type GradientControlChange =
 export type NoiseSettings = {
   seed: string;
   source: 'noise' | 'svg' | 'video' | 'image';
+  renderMode: 'flat' | 'terrain';
   svgDataUrl: string | null;
   svgMode: '2d' | '3d';
   svgNoiseEnabled: boolean;
@@ -53,6 +54,11 @@ export type NoiseSettings = {
   videoPositionX: number;
   videoPositionY: number;
   videoScale: number;
+  terrainHeight: number;
+  terrainDepth: number;
+  terrainPitch: number;
+  terrainDistance: number;
+  terrainGlow: number;
   size: number;
   complexity: number;
   contrast: number;
@@ -206,7 +212,7 @@ function cloneOrbit(orbit: SvgOrbit | null): SvgOrbit | null {
 type GlBundle = {
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
-  camera: THREE.OrthographicCamera;
+  camera: THREE.OrthographicCamera | THREE.PerspectiveCamera;
   lineMaterial: THREE.ShaderMaterial;
   pointMaterial: THREE.ShaderMaterial;
 };
@@ -1439,11 +1445,16 @@ function renderWebgl(
   const width = settings.width;
   const height = settings.height;
   bundle.renderer.setSize(width, height, false);
-  bundle.camera.left = 0;
-  bundle.camera.right = width;
-  bundle.camera.top = 0;
-  bundle.camera.bottom = height;
-  bundle.camera.updateProjectionMatrix();
+  disposeTerrainObjects(bundle.scene);
+  const camera = bundle.camera instanceof THREE.OrthographicCamera
+    ? bundle.camera
+    : new THREE.OrthographicCamera(0, 1, 0, 1, -10, 10);
+  bundle.camera = camera;
+  camera.left = 0;
+  camera.right = width;
+  camera.top = 0;
+  camera.bottom = height;
+  camera.updateProjectionMatrix();
   const background = hexToRgba(settings.backgroundColor, settings.transparentBackground ? 0 : 1);
   bundle.renderer.setClearColor(new THREE.Color(background[0], background[1], background[2]), background[3]);
   bundle.renderer.clear();
@@ -1455,6 +1466,250 @@ function renderWebgl(
   drawVertices(bundle, frame.pathPointVertices, frame.pathPointAlphas, 'points', hexToRgba(settings.pathColor, 1), settings, false, Math.max(5.5, settings.pathThickness * 2.6));
   drawVertices(bundle, frame.nodeVertices, frame.nodeAlphas, 'points', hexToRgba(settings.foregroundColor, 1), settings, true, Math.max(1.2, settings.nodeSize * 2.3));
   drawVertices(bundle, frame.stubNodeVertices, frame.stubNodeAlphas, 'points', hexToRgba(settings.foregroundColor, 0.88), settings, true, Math.max(1, settings.nodeSize * 1.45));
+}
+
+type TerrainPoint = {
+  x: number;
+  y: number;
+  z: number;
+  depth: number;
+  weight: number;
+};
+
+function terrainWeight(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null, phase: number) {
+  if (settings.source === 'video' || settings.source === 'image') return sampleMask(mask, x, y);
+  return sampleSourceField(seed, x, y, settings, mask, phase);
+}
+
+function terrainPoint(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null, phase: number): TerrainPoint {
+  const worldDepth = 920 * settings.terrainDepth;
+  const worldWidth = worldDepth * (settings.width / Math.max(1, settings.height));
+  const depth = y / Math.max(1, settings.height);
+  const weight = terrainWeight(seed, x, y, settings, mask, phase);
+  const ridge = Math.pow(Math.max(0, weight), 1.65);
+  return {
+    x: (x / Math.max(1, settings.width) - 0.5) * worldWidth,
+    y: (ridge - 0.28) * 280 * settings.terrainHeight,
+    z: (depth - 0.5) * worldDepth,
+    depth,
+    weight,
+  };
+}
+
+function terrainColor(settings: NoiseSettings, depth: number, weight: number, boost = 0) {
+  const stops = shaderGradientStops(settings);
+  const t = clamp01(depth * 0.88 + weight * 0.12);
+  let color = hexToRgba(settings.foregroundColor, 1);
+  if (settings.colorMode === 'gradient' && stops.length) {
+    let previous = stops[0];
+    let next = stops[stops.length - 1];
+    for (let index = 1; index < stops.length; index += 1) {
+      if (t <= stops[index].position) {
+        previous = stops[index - 1];
+        next = stops[index];
+        break;
+      }
+    }
+    const span = Math.max(0.0001, next.position - previous.position);
+    const mix = smoothstep(clamp01((t - previous.position) / span));
+    color = [
+      previous.color[0] + (next.color[0] - previous.color[0]) * mix,
+      previous.color[1] + (next.color[1] - previous.color[1]) * mix,
+      previous.color[2] + (next.color[2] - previous.color[2]) * mix,
+      1,
+    ];
+  }
+  const lift = 0.22 + weight * 0.78 + boost;
+  return [
+    Math.min(1, color[0] * lift),
+    Math.min(1, color[1] * lift),
+    Math.min(1, color[2] * lift),
+  ];
+}
+
+function pushTerrainPolyline(
+  positions: number[],
+  colors: number[],
+  seed: number,
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+  settings: NoiseSettings,
+  mask: FieldMask | null,
+  phase: number,
+  organicity: number,
+  boost = 0,
+) {
+  const control = curveControlPoint(a, b, organicity);
+  const samples = 5;
+  let previous: TerrainPoint | null = null;
+  for (let index = 0; index <= samples; index += 1) {
+    const t = index / samples;
+    const point = control ? quadraticPoint(a, control, b, t) : {
+      x: a.x + (b.x - a.x) * t,
+      y: a.y + (b.y - a.y) * t,
+    };
+    const current = terrainPoint(seed, point.x, point.y, settings, mask, phase);
+    if (previous) {
+      positions.push(previous.x, previous.y, previous.z, current.x, current.y, current.z);
+      colors.push(
+        ...terrainColor(settings, previous.depth, previous.weight, boost),
+        ...terrainColor(settings, current.depth, current.weight, boost),
+      );
+    }
+    previous = current;
+  }
+}
+
+function disposeTerrainObjects(scene: THREE.Scene) {
+  for (const object of [...scene.children]) {
+    scene.remove(object);
+    if ('geometry' in object && object.geometry instanceof THREE.BufferGeometry) object.geometry.dispose();
+    if ('material' in object) {
+      const material = object.material;
+      if (Array.isArray(material)) material.forEach((item) => item.dispose());
+      else if (material instanceof THREE.Material) material.dispose();
+    }
+  }
+}
+
+function renderTerrainWebgl(
+  bundle: GlBundle,
+  pool: PatternPool,
+  settings: NoiseSettings,
+  mask: FieldMask | null,
+  phase = 0,
+) {
+  const width = settings.width;
+  const height = settings.height;
+  bundle.renderer.setSize(width, height, false);
+  disposeTerrainObjects(bundle.scene);
+
+  const background = hexToRgba(settings.backgroundColor, settings.transparentBackground ? 0 : 1);
+  bundle.renderer.setClearColor(new THREE.Color(background[0], background[1], background[2]), background[3]);
+  bundle.renderer.clear();
+
+  const aspect = width / Math.max(1, height);
+  const camera = bundle.camera instanceof THREE.PerspectiveCamera
+    ? bundle.camera
+    : new THREE.PerspectiveCamera(42, aspect, 1, 5000);
+  bundle.camera = camera;
+  const worldDepth = 920 * settings.terrainDepth;
+  camera.aspect = aspect;
+  camera.fov = 38 + settings.terrainPitch * 10;
+  camera.near = 1;
+  camera.far = 5000;
+  camera.position.set(0, worldDepth * (0.16 + settings.terrainPitch * 0.42), worldDepth * (0.42 + settings.terrainDistance * 0.72));
+  camera.lookAt(0, 20 * settings.terrainHeight, -worldDepth * 0.18);
+  camera.updateProjectionMatrix();
+
+  const seed = hashSeed(settings.seed);
+  const useSvgNoiseField = settings.source === 'svg' && shouldUseNoiseInsideSvg(settings);
+  const threshold = isMaskedSource(settings)
+    ? (useSvgNoiseField ? 0.26 : 0.5)
+    : 0.38 - settings.nodeDensity * 0.16;
+  const weights = new Float32Array(pool.nodes.length);
+  const active = new Uint8Array(pool.nodes.length);
+  const linePositions: number[] = [];
+  const lineColors: number[] = [];
+  const pathPositions: number[] = [];
+  const pathColors: number[] = [];
+  const pointPositions: number[] = [];
+  const pointColors: number[] = [];
+  const pathPointPositions: number[] = [];
+  const pathPointColors: number[] = [];
+
+  for (const node of pool.nodes) {
+    const weight = terrainWeight(seed, node.x, node.y, settings, mask, phase);
+    weights[node.id] = weight;
+    active[node.id] = weight > threshold && node.gate < 0.2 + weight * 0.9 ? 1 : 0;
+    if (active[node.id]) {
+      const point = terrainPoint(seed, node.x, node.y, settings, mask, phase);
+      pointPositions.push(point.x, point.y, point.z);
+      pointColors.push(...terrainColor(settings, point.depth, point.weight, settings.terrainGlow * 0.25));
+    }
+  }
+
+  for (const edge of pool.edges) {
+    if (pool.pathEdges.has(edge.id)) continue;
+    if (!active[edge.a.id] || !active[edge.b.id]) continue;
+    const midpointX = (edge.a.x + edge.b.x) * 0.5;
+    const midpointY = (edge.a.y + edge.b.y) * 0.5;
+    const midpointWeight = terrainWeight(seed, midpointX, midpointY, settings, mask, phase);
+    if (midpointWeight < (isMaskedSource(settings) ? (useSvgNoiseField ? 0.24 : 0.5) : 0.22)) continue;
+    if (edge.gate >= 0.16 + settings.connectionDensity * 0.46 + edge.angle * settings.angleBias * 0.24) continue;
+    pushTerrainPolyline(linePositions, lineColors, seed, edge.a, edge.b, settings, mask, phase, settings.organicity * 1.2, settings.terrainGlow * 0.1);
+  }
+
+  for (const connection of pool.pathConnections) {
+    pushTerrainPolyline(pathPositions, pathColors, seed, connection.a, connection.b, settings, mask, phase, settings.organicity * 0.9, 0.55 + settings.terrainGlow * 0.35);
+  }
+
+  for (const nodeId of pool.pathPointIds) {
+    const node = pool.nodes[nodeId];
+    if (!node) continue;
+    const point = terrainPoint(seed, node.x, node.y, settings, mask, phase);
+    pathPointPositions.push(point.x, point.y + 2, point.z);
+    pathPointColors.push(...terrainColor(settings, point.depth, point.weight, 0.75));
+  }
+
+  const makeLineObject = (positions: number[], colors: number[], opacity: number) => {
+    if (!positions.length) return null;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
+    const material = new THREE.LineBasicMaterial({
+      vertexColors: true,
+      transparent: true,
+      opacity,
+      blending: THREE.AdditiveBlending,
+      depthTest: true,
+      depthWrite: false,
+    });
+    return new THREE.LineSegments(geometry, material);
+  };
+
+  const makePointObject = (positions: number[], colors: number[], size: number, opacity: number) => {
+    if (!positions.length) return null;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(colors), 3));
+    const material = new THREE.PointsMaterial({
+      vertexColors: true,
+      transparent: true,
+      opacity,
+      size,
+      sizeAttenuation: true,
+      blending: THREE.AdditiveBlending,
+      depthTest: true,
+      depthWrite: false,
+    });
+    return new THREE.Points(geometry, material);
+  };
+
+  const objects = [
+    makeLineObject(linePositions, lineColors, 0.38 + settings.terrainGlow * 0.28),
+    makePointObject(pointPositions, pointColors, Math.max(2.5, settings.nodeSize * 8), 0.6 + settings.terrainGlow * 0.28),
+    makeLineObject(pathPositions, pathColors, 0.82),
+    makePointObject(pathPointPositions, pathPointColors, Math.max(8, settings.pathThickness * 8), 0.95),
+  ].filter(Boolean) as THREE.Object3D[];
+
+  for (const object of objects) bundle.scene.add(object);
+  bundle.renderer.render(bundle.scene, camera);
+}
+
+function renderActiveWebgl(
+  bundle: GlBundle,
+  pool: PatternPool,
+  settings: NoiseSettings,
+  mask: FieldMask | null,
+  phase = 0,
+  frameCacheRef?: FrameGeometryCacheRef,
+) {
+  if (settings.renderMode === 'terrain') {
+    renderTerrainWebgl(bundle, pool, settings, mask, phase);
+    return;
+  }
+  renderWebgl(bundle, pool, settings, mask, phase, frameCacheRef);
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -1866,7 +2121,7 @@ async function exportLoopVideo(settings: NoiseSettings, orbit: SvgOrbit | null) 
   const duration = Math.max(2, settings.loopDuration);
   const mimeType = preferredVideoMimeType();
   const extension = mimeType.includes('mp4') ? 'mp4' : 'webm';
-  renderWebgl(bundle, pool, settings, mask, 0);
+  renderActiveWebgl(bundle, pool, settings, mask, 0);
   const stream = canvas.captureStream(fps);
   const track = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined;
   const chunks: BlobPart[] = [];
@@ -1893,9 +2148,9 @@ async function exportLoopVideo(settings: NoiseSettings, orbit: SvgOrbit | null) 
       if (dynamicSource) {
         const frameMask = await createSourceMask(settings, phase, exportOrbit);
         const framePool = buildPatternPool(settings, frameMask);
-        renderWebgl(bundle, framePool, settings, frameMask, phase);
+        renderActiveWebgl(bundle, framePool, settings, frameMask, phase);
       } else {
-        renderWebgl(bundle, pool, settings, mask, phase);
+        renderActiveWebgl(bundle, pool, settings, mask, phase);
       }
       track?.requestFrame?.();
     };
@@ -1928,6 +2183,7 @@ async function exportLoopVideo(settings: NoiseSettings, orbit: SvgOrbit | null) 
   recorder.stop();
   await stopped;
   stream.getTracks().forEach((streamTrack) => streamTrack.stop());
+  disposeTerrainObjects(bundle.scene);
   bundle.lineMaterial.dispose();
   bundle.pointMaterial.dispose();
   bundle.renderer.dispose();
@@ -2236,7 +2492,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
         if (!cancelled) {
           const pool = stableVideoPool ?? getCachedPatternPool(poolCacheRef, settings, mask);
           poolRef.current = pool;
-          renderWebgl(bundle, pool, settings, mask, phase, frameCacheRef);
+          renderActiveWebgl(bundle, pool, settings, mask, phase, frameCacheRef);
           drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), phase, mask);
         }
         renderingDynamicMask = false;
@@ -2273,13 +2529,13 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
       if (now - lastFrameAt >= frameInterval) {
         lastFrameAt = now;
         const phase = ((now / 1000) % settings.loopDuration) / settings.loopDuration;
-        renderWebgl(bundle, pool, settings, sourceMask, phase, frameCacheRef);
+        renderActiveWebgl(bundle, pool, settings, sourceMask, phase, frameCacheRef);
         drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), phase, sourceMask);
       }
       animationId = window.requestAnimationFrame(tick);
     };
 
-    renderWebgl(bundle, pool, settings, sourceMask, 0, frameCacheRef);
+    renderActiveWebgl(bundle, pool, settings, sourceMask, 0, frameCacheRef);
     drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), 0, sourceMask);
     if (settings.motionEnabled) animationId = window.requestAnimationFrame(tick);
 
