@@ -2206,9 +2206,12 @@ async function createVideoMask(settings: NoiseSettings, phase = 0, playback: 'se
     image.data[index + 2] = value;
     image.data[index + 3] = 255;
   }
-  cache.context.putImageData(image, 0, 0);
 
-  return imageDataToMask(cache.context, settings.width, settings.height);
+  return {
+    width: settings.width,
+    height: settings.height,
+    pixels: image.data,
+  };
 }
 
 async function getImageMaskCache(settings: NoiseSettings): Promise<ImageMaskCache | null> {
@@ -2263,9 +2266,12 @@ async function createImageMask(settings: NoiseSettings): Promise<FieldMask | nul
     image.data[index + 2] = value;
     image.data[index + 3] = 255;
   }
-  cache.context.putImageData(image, 0, 0);
 
-  return imageDataToMask(cache.context, settings.width, settings.height);
+  return {
+    width: settings.width,
+    height: settings.height,
+    pixels: image.data,
+  };
 }
 async function createSourceMask(settings: NoiseSettings, phase = 0, orbit: SvgOrbit | null = null, videoPlayback: 'seek' | 'play' = 'seek'): Promise<FieldMask | null> {
   if (settings.source === 'svg') return createSvgMask(settings, phase, orbit);
@@ -2288,13 +2294,14 @@ async function exportLoopVideo(settings: NoiseSettings, orbit: SvgOrbit | null) 
   }
 
   const exportOrbit = cloneOrbit(orbit);
-  const mask = await createSourceMask(settings, 0, exportOrbit);
-  const pool = buildPatternPool(settings, mask);
+  const mask = settings.source === 'video' ? null : await createSourceMask(settings, 0, exportOrbit);
+  const pool = buildPatternPool(settings, settings.source === 'video' ? null : mask);
   const fps = Math.max(6, Math.min(30, Math.round(settings.frameRate)));
-  const duration = Math.max(2, settings.loopDuration);
+  const duration = Math.max(0.25, settings.loopDuration);
+  const totalFrames = Math.max(1, Math.round(duration * fps));
+  const frameInterval = 1000 / fps;
   const mimeType = preferredVideoMimeType();
   const extension = mimeType.includes('mp4') ? 'mp4' : 'webm';
-  renderActiveWebgl(bundle, pool, settings, mask, 0);
   const stream = canvas.captureStream(fps);
   const track = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack | undefined;
   const chunks: BlobPart[] = [];
@@ -2308,45 +2315,48 @@ async function exportLoopVideo(settings: NoiseSettings, orbit: SvgOrbit | null) 
   });
 
   recorder.start();
-  track?.requestFrame?.();
+
+  const renderFrame = async (phase: number) => {
+    const dynamicSource = (settings.source === 'svg' && settings.svgMode === '3d' && settings.svgAnimate)
+      || settings.source === 'video';
+    if (dynamicSource) {
+      const frameMask = await createSourceMask(settings, phase, exportOrbit, settings.source === 'video' ? 'play' : 'seek');
+      const framePool = settings.source === 'video' ? pool : buildPatternPool(settings, frameMask);
+      renderActiveWebgl(bundle, framePool, settings, frameMask, phase);
+    } else {
+      renderActiveWebgl(bundle, pool, settings, mask, phase);
+    }
+    track?.requestFrame?.();
+  };
 
   await new Promise<void>((resolve) => {
     const startedAt = performance.now();
-    let lastFrameAt = 0;
+    let lastFrameIndex = -1;
     let rendering = false;
+    let finished = false;
 
-    const renderFrame = async (phase: number) => {
-      const dynamicSource = (settings.source === 'svg' && settings.svgMode === '3d' && settings.svgAnimate)
-        || settings.source === 'video';
-      if (dynamicSource) {
-        const frameMask = await createSourceMask(settings, phase, exportOrbit);
-        const framePool = buildPatternPool(settings, frameMask);
-        renderActiveWebgl(bundle, framePool, settings, frameMask, phase);
-      } else {
-        renderActiveWebgl(bundle, pool, settings, mask, phase);
-      }
-      track?.requestFrame?.();
+    const finish = () => {
+      if (finished || rendering) return;
+      finished = true;
+      resolve();
     };
 
     const tick = (now: number) => {
       const elapsed = now - startedAt;
-      const frameInterval = 1000 / fps;
-      if (!rendering && (elapsed - lastFrameAt >= frameInterval || lastFrameAt === 0)) {
-        lastFrameAt = elapsed;
+      const frameIndex = Math.min(totalFrames - 1, Math.floor(elapsed / frameInterval));
+      if (!rendering && frameIndex !== lastFrameIndex) {
+        lastFrameIndex = frameIndex;
         rendering = true;
-        const phase = Math.min(0.999999, elapsed / (duration * 1000));
-        void renderFrame(phase).finally(() => {
+        void renderFrame(frameIndex / totalFrames).finally(() => {
           rendering = false;
-          if (performance.now() - startedAt >= duration * 1000) {
-            resolve();
-          }
+          if (performance.now() - startedAt >= duration * 1000) finish();
         });
       }
 
-      if (elapsed < duration * 1000) {
+      if (elapsed < duration * 1000 || rendering) {
         window.requestAnimationFrame(tick);
-      } else if (!rendering) {
-        resolve();
+      } else {
+        finish();
       }
     };
 
