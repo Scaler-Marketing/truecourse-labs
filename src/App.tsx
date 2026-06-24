@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { DialRoot, DialStore, useDialKit, type DialConfig } from 'dialkit';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { createPortal } from 'react-dom';
+import { DialRoot, DialStore, useDialKit, type DialConfig, type DialValue, type Preset } from 'dialkit';
+import { Check, Pencil, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import 'dialkit/styles.css';
 import './App.css';
 import { NoiseCanvas, type GradientControlChange, type NoiseSettings, type PathWaypoint, type TerrainCameraControlChange } from './components/NoiseCanvas';
@@ -376,6 +378,126 @@ function readVideoDuration(src: string) {
     video.src = src;
   });
 }
+const presetStorageVersion = 1;
+const presetStoragePrefix = 'truecourse-labs:dialkit-presets';
+
+type StoredPresetState = {
+  version: typeof presetStorageVersion;
+  presets: Preset[];
+  activePresetId: string | null;
+};
+
+type DialStoreInternals = {
+  presets?: Map<string, Preset[]>;
+  activePreset?: Map<string, string | null>;
+  snapshots?: Map<string, Record<string, DialValue>>;
+  notify?: (panelId: string) => void;
+  savePreset: (panelId: string, name: string) => string;
+};
+
+let presetSavePatchInstalled = false;
+
+function presetStorageKey(panelName: string) {
+  return `${presetStoragePrefix}:v${presetStorageVersion}:${panelName}`;
+}
+
+function clonePreset(preset: Preset): Preset {
+  return {
+    id: preset.id,
+    name: preset.name,
+    values: { ...preset.values },
+  };
+}
+
+function parseStoredPresetState(value: string | null): StoredPresetState | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<StoredPresetState>;
+    if (parsed.version !== presetStorageVersion || !Array.isArray(parsed.presets)) return null;
+    const presets = parsed.presets
+      .filter((preset): preset is Preset => (
+        typeof preset?.id === 'string'
+        && typeof preset.name === 'string'
+        && preset.values !== null
+        && typeof preset.values === 'object'
+        && !Array.isArray(preset.values)
+      ))
+      .map(clonePreset);
+    const activePresetId = typeof parsed.activePresetId === 'string'
+      && presets.some((preset) => preset.id === parsed.activePresetId)
+      ? parsed.activePresetId
+      : null;
+    return { version: presetStorageVersion, presets, activePresetId };
+  } catch {
+    return null;
+  }
+}
+
+function loadStoredPresetState(panelName: string): StoredPresetState | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return parseStoredPresetState(window.localStorage.getItem(presetStorageKey(panelName)));
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredPresetState(panelId: string, panelName: string) {
+  if (typeof window === 'undefined') return;
+  const state: StoredPresetState = {
+    version: presetStorageVersion,
+    presets: DialStore.getPresets(panelId).map(clonePreset),
+    activePresetId: DialStore.getActivePresetId(panelId),
+  };
+  try {
+    window.localStorage.setItem(presetStorageKey(panelName), JSON.stringify(state));
+  } catch {
+    // Storage can be unavailable in some browser privacy modes.
+  }
+}
+
+function hydrateStoredPresetState(panelId: string, panelName: string) {
+  const stored = loadStoredPresetState(panelName);
+  if (!stored) return;
+
+  const store = DialStore as unknown as DialStoreInternals;
+  const panel = DialStore.getPanel(panelId);
+  store.presets?.set(panelId, stored.presets.map(clonePreset));
+  store.activePreset?.set(panelId, stored.activePresetId);
+
+  const activePreset = stored.presets.find((preset) => preset.id === stored.activePresetId);
+  if (panel && activePreset) {
+    panel.values = { ...activePreset.values };
+    store.snapshots?.set(panelId, { ...activePreset.values });
+  }
+
+  store.notify?.(panelId);
+}
+
+function installPresetSavePatch(panelName: string) {
+  if (presetSavePatchInstalled || typeof window === 'undefined') return;
+  presetSavePatchInstalled = true;
+
+  const store = DialStore as unknown as DialStoreInternals;
+  const originalSavePreset = store.savePreset.bind(DialStore);
+  store.savePreset = (panelId: string, name: string) => {
+    const presetId = originalSavePreset(panelId, name);
+    const panel = DialStore.getPanel(panelId);
+    if (panel?.name === panelName) {
+      window.dispatchEvent(new CustomEvent('truecourse:preset-created', { detail: { panelId, presetId } }));
+    }
+    return presetId;
+  };
+}
+
+function renamePreset(panelId: string, presetId: string, name: string) {
+  const store = DialStore as unknown as DialStoreInternals;
+  const presets = store.presets?.get(panelId);
+  const preset = presets?.find((item) => item.id === presetId);
+  if (!preset) return;
+  preset.name = name;
+  store.notify?.(panelId);
+}
 
 function createBindingsSettings(
   controls: LabControls,
@@ -481,6 +603,154 @@ function createBindingsSettings(
   };
 }
 
+type PresetModalState =
+  | { mode: 'create'; panelId: string; presetId: string }
+  | { mode: 'rename'; panelId: string; presetId: string }
+  | { mode: 'manage'; panelId: string };
+
+type PresetModalProps = {
+  state: PresetModalState;
+  presets: Preset[];
+  activePresetId: string | null;
+  onClose: () => void;
+  onRename: (panelId: string, presetId: string, name: string) => void;
+  onRequestRename: (panelId: string, presetId: string) => void;
+  onDelete: (panelId: string, presetId: string) => void;
+  onSelect: (panelId: string, presetId: string) => void;
+};
+
+type PresetManageButtonProps = {
+  panelId: string | null;
+  onManage: () => void;
+};
+
+function PresetManageButton({ panelId, onManage }: PresetManageButtonProps) {
+  const [toolbar, setToolbar] = useState<HTMLElement | null>(null);
+
+  useEffect(() => {
+    const findToolbar = () => {
+      setToolbar(document.querySelector<HTMLElement>('.control-rail .dialkit-panel-toolbar'));
+    };
+
+    findToolbar();
+    const frame = window.requestAnimationFrame(findToolbar);
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  if (!toolbar) return null;
+
+  return createPortal(
+    <div className="preset-manage-row">
+      <button
+        className="preset-manage-button"
+        type="button"
+        disabled={!panelId}
+        onClick={onManage}
+      >
+        <SlidersHorizontal size={15} />
+        Manage presets
+      </button>
+    </div>,
+    toolbar,
+  );
+}
+function PresetModal({ state, presets, activePresetId, onClose, onRename, onRequestRename, onDelete, onSelect }: PresetModalProps) {
+  const activePreset = state.mode === 'manage'
+    ? null
+    : presets.find((preset) => preset.id === state.presetId) ?? null;
+  const [name, setName] = useState(activePreset?.name ?? '');
+
+  useEffect(() => {
+    setName(activePreset?.name ?? '');
+  }, [activePreset?.id, activePreset?.name]);
+
+  const closeModal = () => {
+    if (state.mode === 'create') onDelete(state.panelId, state.presetId);
+    onClose();
+  };
+
+  const submitName = (event: FormEvent) => {
+    event.preventDefault();
+    if (state.mode === 'manage') return;
+    const nextName = name.trim();
+    if (!nextName) return;
+    onRename(state.panelId, state.presetId, nextName);
+    onClose();
+  };
+
+  return (
+    <div className="preset-modal-backdrop" role="presentation" onMouseDown={closeModal}>
+      <section
+        className="preset-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="preset-modal-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="preset-modal-header">
+          <div>
+            <h2 id="preset-modal-title">{state.mode === 'manage' ? 'Presets' : state.mode === 'create' ? 'Name preset' : 'Rename preset'}</h2>
+            <p>{state.mode === 'manage' ? 'Saved locally in this browser.' : 'Choose a name for this saved parameter set.'}</p>
+          </div>
+          <button className="preset-icon-button" type="button" onClick={closeModal} aria-label="Close preset modal">
+            <X size={16} />
+          </button>
+        </header>
+
+        {state.mode === 'manage' ? (
+          <div className="preset-list">
+            {presets.length ? presets.map((preset) => (
+              <div className="preset-list-item" key={preset.id} data-active={String(preset.id === activePresetId)}>
+                <button className="preset-list-name" type="button" onClick={() => onSelect(state.panelId, preset.id)}>
+                  <span>{preset.name}</span>
+                  {preset.id === activePresetId ? <small>Active</small> : null}
+                </button>
+                <div className="preset-list-actions">
+                  <button
+                    className="preset-icon-button"
+                    type="button"
+                    onClick={() => onRequestRename(state.panelId, preset.id)}
+                    aria-label={`Rename ${preset.name}`}
+                    data-action="rename"
+                  >
+                    <Pencil size={15} />
+                  </button>
+                  <button
+                    className="preset-icon-button"
+                    type="button"
+                    onClick={() => onDelete(state.panelId, preset.id)}
+                    aria-label={`Delete ${preset.name}`}
+                    data-action="delete"
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              </div>
+            )) : <div className="preset-empty">No saved presets yet.</div>}
+          </div>
+        ) : (
+          <form className="preset-name-form" onSubmit={submitName}>
+            <label htmlFor="preset-name-input">Preset name</label>
+            <input
+              id="preset-name-input"
+              autoFocus
+              value={name}
+              onChange={(event) => setName(event.currentTarget.value)}
+              placeholder="Preset name"
+            />
+            <div className="preset-modal-footer">
+              <button className="preset-secondary-button" type="button" onClick={closeModal}>Cancel</button>
+              <button className="preset-primary-button" type="submit" disabled={!name.trim()}>
+                <Check size={15} />
+                Save
+              </button>
+            </div>
+          </form>
+        )}
+      </section>
+    </div>
+  );
+}
 function Lab() {
   const [bindingsSource, setBindingsSource] = useState<BindingsSource>('noise');
   const [renderMode, setRenderMode] = useState<'flat' | 'terrain'>('flat');
@@ -514,6 +784,63 @@ function Lab() {
     [bindingsSource, colorMode, gradientEditEnabled, gradientStopCount, gradientType, pathEnabled, pathMode, renderMode, svgMode, svgNoiseEnabled, videoDuration],
   );
   const panelName = 'TrueCourse Patterns';
+  const [presetRevision, setPresetRevision] = useState(0);
+  const [presetModal, setPresetModal] = useState<PresetModalState | null>(null);
+  const presetPanel = DialStore.getPanels().find((item) => item.name === panelName);
+  const presetPanelId = presetPanel?.id ?? null;
+  const presets = presetPanelId ? DialStore.getPresets(presetPanelId) : [];
+  const activePresetId = presetPanelId ? DialStore.getActivePresetId(presetPanelId) : null;
+  void presetRevision;
+
+  useEffect(() => {
+    installPresetSavePatch(panelName);
+
+    let unsubscribePanel: (() => void) | null = null;
+    let unsubscribeGlobal: (() => void) | null = null;
+    let hydrated = false;
+
+    const initializePresetStorage = () => {
+      const panel = DialStore.getPanels().find((item) => item.name === panelName);
+      if (!panel) return false;
+
+      if (!hydrated) {
+        hydrateStoredPresetState(panel.id, panelName);
+        hydrated = true;
+      }
+
+      unsubscribePanel?.();
+      unsubscribePanel = DialStore.subscribe(panel.id, () => {
+        saveStoredPresetState(panel.id, panelName);
+        setPresetRevision((value) => value + 1);
+      });
+      saveStoredPresetState(panel.id, panelName);
+      setPresetRevision((value) => value + 1);
+      return true;
+    };
+
+    const handlePresetCreated = (event: Event) => {
+      const detail = (event as CustomEvent<{ panelId: string; presetId: string }>).detail;
+      if (!detail?.panelId || !detail.presetId) return;
+      setPresetModal({ mode: 'create', panelId: detail.panelId, presetId: detail.presetId });
+    };
+
+    window.addEventListener('truecourse:preset-created', handlePresetCreated);
+
+    if (!initializePresetStorage()) {
+      unsubscribeGlobal = DialStore.subscribeGlobal(() => {
+        if (initializePresetStorage()) {
+          unsubscribeGlobal?.();
+          unsubscribeGlobal = null;
+        }
+      });
+    }
+
+    return () => {
+      unsubscribePanel?.();
+      unsubscribeGlobal?.();
+      window.removeEventListener('truecourse:preset-created', handlePresetCreated);
+    };
+  }, [panelName]);
 
   const controls = useDialKit(
     panelName,
@@ -652,6 +979,28 @@ function Lab() {
     setPendingExport(false);
   }, [debouncedSettings, pendingExport]);
 
+  const commitPresetRename = (panelId: string, presetId: string, name: string) => {
+    renamePreset(panelId, presetId, name);
+    saveStoredPresetState(panelId, panelName);
+    setPresetRevision((value) => value + 1);
+  };
+
+  const deletePreset = (panelId: string, presetId: string) => {
+    DialStore.deletePreset(panelId, presetId);
+    saveStoredPresetState(panelId, panelName);
+    setPresetRevision((value) => value + 1);
+  };
+
+  const selectPreset = (panelId: string, presetId: string) => {
+    DialStore.loadPreset(panelId, presetId);
+    saveStoredPresetState(panelId, panelName);
+    setPresetRevision((value) => value + 1);
+  };
+
+  const requestPresetRename = (panelId: string, presetId: string) => {
+    setPresetModal({ mode: 'rename', panelId, presetId });
+  };
+
   return (
     <main className="app-shell">
       <input
@@ -717,7 +1066,24 @@ function Lab() {
 
       <aside className="control-rail">
         <DialRoot mode="inline" theme="dark" productionEnabled />
+        <PresetManageButton
+          panelId={presetPanelId}
+          onManage={() => presetPanelId && setPresetModal({ mode: 'manage', panelId: presetPanelId })}
+        />
       </aside>
+
+      {presetModal ? (
+        <PresetModal
+          state={presetModal}
+          presets={presets}
+          activePresetId={activePresetId}
+          onClose={() => setPresetModal(null)}
+          onRename={commitPresetRename}
+          onRequestRename={requestPresetRename}
+          onDelete={deletePreset}
+          onSelect={selectPreset}
+        />
+      ) : null}
     </main>
   );
 }
