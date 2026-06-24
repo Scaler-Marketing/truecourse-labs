@@ -145,6 +145,7 @@ function createGradientStopControls(count: number) {
 
 function createDialConfig(
   bindingsSource: BindingsSource,
+  renderMode: 'flat' | 'terrain',
   svgNoiseEnabled: boolean,
   svgMode: SvgMode,
   videoDuration: number | null,
@@ -177,16 +178,20 @@ function createDialConfig(
       },
       renderMode: {
         type: 'select',
-        default: 'flat',
+        default: renderMode,
         options: [
           { value: 'flat', label: 'Flat' },
           { value: 'terrain', label: 'Terrain' },
         ],
       },
-      terrainHeight: slider(0.55, 0, 1, 0.01),
-      terrainDepth: slider(1, 0.4, 2, 0.01),
-      terrainCoverage: slider(1, 0.75, 2.5, 0.01),
-      terrainGlow: slider(0.72, 0, 1, 0.01),
+      ...(renderMode === 'terrain'
+        ? {
+            terrainHeight: slider(0.55, 0, 1, 0.01),
+            terrainDepth: slider(1, 0.4, 2, 0.01),
+            terrainCoverage: slider(1, 0.75, 2.5, 0.01),
+            terrainGlow: slider(0.72, 0, 1, 0.01),
+          }
+        : {}),
       ...(bindingsSource === 'svg'
         ? {
             loadSvg: { type: 'action', label: 'Load SVG' },
@@ -223,15 +228,19 @@ function createDialConfig(
       nodeSize: slider(0.86, 0.2, 2.4, 0.02),
       lineWidth: slider(0.58, 0.12, 2.4, 0.02),
     },
-    Camera: {
-      positionX: slider(0, -1.5, 1.5, 0.01),
-      positionY: slider(0.34, -0.2, 1.25, 0.01),
-      positionZ: slider(0.94, -0.5, 1.8, 0.01),
-      targetX: slider(0, -1.5, 1.5, 0.01),
-      targetY: slider(0.02, -0.35, 0.85, 0.01),
-      targetZ: slider(-0.18, -1.2, 1.2, 0.01),
-      fov: slider(42, 20, 75, 1),
-    },
+    ...(renderMode === 'terrain'
+      ? {
+          Camera: {
+            positionX: slider(0, -1.5, 1.5, 0.01),
+            positionY: slider(0.34, -0.2, 1.25, 0.01),
+            positionZ: slider(0.94, -0.5, 1.8, 0.01),
+            targetX: slider(0, -1.5, 1.5, 0.01),
+            targetY: slider(0.02, -0.35, 0.85, 0.01),
+            targetZ: slider(-0.18, -1.2, 1.2, 0.01),
+            fov: slider(42, 20, 75, 1),
+          },
+        }
+      : {}),
     Color: {
       backgroundColor: '#041426',
       colorMode: {
@@ -474,6 +483,7 @@ function createBindingsSettings(
 
 function Lab() {
   const [bindingsSource, setBindingsSource] = useState<BindingsSource>('noise');
+  const [renderMode, setRenderMode] = useState<'flat' | 'terrain'>('flat');
   const [svgNoiseEnabled, setSvgNoiseEnabled] = useState(false);
   const [svgMode, setSvgMode] = useState<SvgMode>('2d');
   const [pathEnabled, setPathEnabled] = useState(true);
@@ -500,8 +510,8 @@ function Lab() {
     endY: 0.5,
   });
   const config = useMemo(
-    () => createDialConfig(bindingsSource, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode, gradientStopCount, gradientEditEnabled, colorMode, gradientType),
-    [bindingsSource, colorMode, gradientEditEnabled, gradientStopCount, gradientType, pathEnabled, pathMode, svgMode, svgNoiseEnabled, videoDuration],
+    () => createDialConfig(bindingsSource, renderMode, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode, gradientStopCount, gradientEditEnabled, colorMode, gradientType),
+    [bindingsSource, colorMode, gradientEditEnabled, gradientStopCount, gradientType, pathEnabled, pathMode, renderMode, svgMode, svgNoiseEnabled, videoDuration],
   );
   const panelName = 'TrueCourse Patterns';
 
@@ -556,6 +566,11 @@ function Lab() {
       setBindingsSource(nextSource);
     }
   }, [bindingsSource, controls.Bindings?.source]);
+
+  useEffect(() => {
+    const nextRenderMode = controls.Bindings?.renderMode === 'terrain' ? 'terrain' : 'flat';
+    if (nextRenderMode !== renderMode) setRenderMode(nextRenderMode);
+  }, [controls.Bindings?.renderMode, renderMode]);
 
   useEffect(() => {
     const nextColorMode = controls.Color?.colorMode === 'gradient' ? 'gradient' : 'solid';

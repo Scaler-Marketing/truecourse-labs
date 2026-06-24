@@ -1532,9 +1532,15 @@ function terrainCameraVectors(settings: NoiseSettings) {
   };
 }
 
-function applyTerrainCameraSettings(camera: THREE.PerspectiveCamera, settings: NoiseSettings) {
-  const { position, target } = terrainCameraVectors(settings);
-  camera.fov = settings.terrainCameraFov;
+type TerrainCameraOverride = {
+  position: THREE.Vector3;
+  target: THREE.Vector3;
+  fov: number;
+};
+
+function applyTerrainCameraSettings(camera: THREE.PerspectiveCamera, settings: NoiseSettings, override?: TerrainCameraOverride | null) {
+  const { position, target } = override ?? terrainCameraVectors(settings);
+  camera.fov = override?.fov ?? settings.terrainCameraFov;
   camera.near = 1;
   camera.far = 5000;
   camera.position.copy(position);
@@ -1553,6 +1559,17 @@ function terrainCameraValueFromWorld(settings: NoiseSettings, position: THREE.Ve
     targetY: target.y / Math.max(1, world.depth),
     targetZ: target.z / Math.max(1, world.depth),
   };
+}
+function terrainCameraOverrideMatchesSettings(settings: NoiseSettings, override: TerrainCameraOverride) {
+  const values = terrainCameraValueFromWorld(settings, override.position, override.target);
+  const close = (a: number, b: number) => Math.abs(a - b) <= 0.003;
+  return close(values.positionX, settings.terrainCameraPositionX)
+    && close(values.positionY, settings.terrainCameraPositionY)
+    && close(values.positionZ, settings.terrainCameraPositionZ)
+    && close(values.targetX, settings.terrainCameraTargetX)
+    && close(values.targetY, settings.terrainCameraTargetY)
+    && close(values.targetZ, settings.terrainCameraTargetZ)
+    && close(override.fov, settings.terrainCameraFov);
 }
 function terrainNodeScreenPosition(
   node: PoolNode,
@@ -1738,6 +1755,7 @@ function renderTerrainWebgl(
   settings: NoiseSettings,
   mask: FieldMask | null,
   phase = 0,
+  terrainCameraOverride?: TerrainCameraOverride | null,
 ) {
   const width = settings.width;
   const height = settings.height;
@@ -1754,7 +1772,7 @@ function renderTerrainWebgl(
     : new THREE.PerspectiveCamera(42, aspect, 1, 5000);
   bundle.camera = camera;
   camera.aspect = aspect;
-  applyTerrainCameraSettings(camera, settings);
+  applyTerrainCameraSettings(camera, settings, terrainCameraOverride);
 
   const seed = hashSeed(settings.seed);
   const useSvgNoiseField = settings.source === 'svg' && shouldUseNoiseInsideSvg(settings);
@@ -1858,9 +1876,10 @@ function renderActiveWebgl(
   mask: FieldMask | null,
   phase = 0,
   frameCacheRef?: FrameGeometryCacheRef,
+  terrainCameraOverride?: TerrainCameraOverride | null,
 ) {
   if (settings.renderMode === 'terrain') {
-    renderTerrainWebgl(bundle, pool, settings, mask, phase);
+    renderTerrainWebgl(bundle, pool, settings, mask, phase, terrainCameraOverride);
     return;
   }
   renderWebgl(bundle, pool, settings, mask, phase, frameCacheRef);
@@ -2404,6 +2423,8 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
   const orbitRef = useRef<SvgOrbit | null>(null);
   const latestSettingsRef = useRef(settings);
   const terrainCameraChangeRef = useRef(onTerrainCameraChange);
+  const terrainCameraOverrideRef = useRef<TerrainCameraOverride | null>(null);
+  const terrainControlsRef = useRef<OrbitControls | null>(null);
   const lastVideoNonceRef = useRef(settings.videoExportNonce);
   const [sourceMask, setSourceMask] = useState<FieldMask | null>(null);
   const [orbitRevision, setOrbitRevision] = useState(0);
@@ -2622,14 +2643,17 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
     const bundle = glRef.current;
     if (!canvas || !bundle || settings.renderMode !== 'terrain') return undefined;
 
+    const activeSettings = latestSettingsRef.current;
     const camera = bundle.camera instanceof THREE.PerspectiveCamera
       ? bundle.camera
-      : new THREE.PerspectiveCamera(settings.terrainCameraFov, settings.width / settings.height, 1, 5000);
+      : new THREE.PerspectiveCamera(activeSettings.terrainCameraFov, activeSettings.width / activeSettings.height, 1, 5000);
     bundle.camera = camera;
-    camera.aspect = settings.width / Math.max(1, settings.height);
-    const target = applyTerrainCameraSettings(camera, settings);
+    camera.aspect = activeSettings.width / Math.max(1, activeSettings.height);
+    const cameraOverride = terrainCameraOverrideRef.current;
+    const target = applyTerrainCameraSettings(camera, activeSettings, cameraOverride);
 
     const controls = new OrbitControls(camera, canvas);
+    terrainControlsRef.current = controls;
     controls.enableDamping = false;
     controls.enablePan = true;
     controls.screenSpacePanning = true;
@@ -2641,7 +2665,27 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
       terrainCameraChangeRef.current?.({ key, value });
     };
 
+    let renderFrame = 0;
+    const syncLiveCameraOverride = () => {
+      terrainCameraOverrideRef.current = {
+        position: camera.position.clone(),
+        target: controls.target.clone(),
+        fov: camera.fov,
+      };
+    };
+
+    const renderCameraChange = () => {
+      syncLiveCameraOverride();
+      if (renderFrame) return;
+      renderFrame = window.requestAnimationFrame(() => {
+        renderFrame = 0;
+        bundle.renderer.clear();
+        bundle.renderer.render(bundle.scene, camera);
+      });
+    };
+
     const updateCameraControls = () => {
+      syncLiveCameraOverride();
       const currentSettings = latestSettingsRef.current;
       const values = terrainCameraValueFromWorld(currentSettings, camera.position, controls.target);
       updateField('positionX', values.positionX, currentSettings.terrainCameraPositionX);
@@ -2652,12 +2696,38 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
       updateField('targetZ', values.targetZ, currentSettings.terrainCameraTargetZ);
     };
 
-    controls.addEventListener('change', updateCameraControls);
+    controls.addEventListener('change', renderCameraChange);
+    controls.addEventListener('end', updateCameraControls);
     return () => {
-      controls.removeEventListener('change', updateCameraControls);
+      window.cancelAnimationFrame(renderFrame);
+      controls.removeEventListener('change', renderCameraChange);
+      controls.removeEventListener('end', updateCameraControls);
+      if (terrainControlsRef.current === controls) terrainControlsRef.current = null;
       controls.dispose();
     };
+  }, [settings.height, settings.renderMode, settings.width]);
+
+  useEffect(() => {
+    const controls = terrainControlsRef.current;
+    const bundle = glRef.current;
+    if (!controls || !bundle || settings.renderMode !== 'terrain') return;
+    const camera = bundle.camera;
+    if (!(camera instanceof THREE.PerspectiveCamera)) return;
+
+    const cameraOverride = terrainCameraOverrideRef.current;
+    if (cameraOverride) {
+      if (terrainCameraOverrideMatchesSettings(settings, cameraOverride)) {
+        terrainCameraOverrideRef.current = null;
+      }
+      return;
+    }
+
+    camera.aspect = settings.width / Math.max(1, settings.height);
+    const target = applyTerrainCameraSettings(camera, settings);
+    controls.target.copy(target);
+    controls.update();
   }, [settings]);
+
   useEffect(() => {
     let cancelled = false;
     const maskSettings = latestSettingsRef.current;
@@ -2708,7 +2778,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
         if (!cancelled) {
           const pool = stableVideoPool ?? getCachedPatternPool(poolCacheRef, settings, mask);
           poolRef.current = pool;
-          renderActiveWebgl(bundle, pool, settings, mask, phase, frameCacheRef);
+          renderActiveWebgl(bundle, pool, settings, mask, phase, frameCacheRef, terrainCameraOverrideRef.current);
           drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), phase, mask);
         }
         renderingDynamicMask = false;
@@ -2745,13 +2815,13 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
       if (now - lastFrameAt >= frameInterval) {
         lastFrameAt = now;
         const phase = ((now / 1000) % settings.loopDuration) / settings.loopDuration;
-        renderActiveWebgl(bundle, pool, settings, sourceMask, phase, frameCacheRef);
+        renderActiveWebgl(bundle, pool, settings, sourceMask, phase, frameCacheRef, terrainCameraOverrideRef.current);
         drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), phase, sourceMask);
       }
       animationId = window.requestAnimationFrame(tick);
     };
 
-    renderActiveWebgl(bundle, pool, settings, sourceMask, 0, frameCacheRef);
+    renderActiveWebgl(bundle, pool, settings, sourceMask, 0, frameCacheRef, terrainCameraOverrideRef.current);
     drawNoiseMapOverlay(overlayCanvas, settings, hashSeed(settings.seed), 0, sourceMask);
     if (settings.motionEnabled) animationId = window.requestAnimationFrame(tick);
 
