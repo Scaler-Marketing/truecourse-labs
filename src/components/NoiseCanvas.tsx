@@ -178,6 +178,8 @@ type FieldMask = {
   width: number;
   height: number;
   pixels: Uint8ClampedArray;
+  sourceWidth?: number;
+  sourceHeight?: number;
 };
 
 type SvgOrbit = {
@@ -411,11 +413,27 @@ function sampleNoiseField(seed: number, x: number, y: number, settings: NoiseSet
   return Math.max(0, Math.min(1, contrasted * (0.52 + settings.brightness)));
 }
 
+function maskPixel(mask: FieldMask, x: number, y: number) {
+  const px = Math.max(0, Math.min(mask.width - 1, x));
+  const py = Math.max(0, Math.min(mask.height - 1, y));
+  return mask.pixels[(py * mask.width + px) * 4] / 255;
+}
+
 function sampleMask(mask: FieldMask | null, x: number, y: number) {
   if (!mask) return 0;
-  const px = Math.max(0, Math.min(mask.width - 1, Math.round(x)));
-  const py = Math.max(0, Math.min(mask.height - 1, Math.round(y)));
-  return mask.pixels[(py * mask.width + px) * 4] / 255;
+  const sourceWidth = Math.max(1, mask.sourceWidth ?? mask.width);
+  const sourceHeight = Math.max(1, mask.sourceHeight ?? mask.height);
+  const px = Math.max(0, Math.min(mask.width - 1, (x / sourceWidth) * (mask.width - 1)));
+  const py = Math.max(0, Math.min(mask.height - 1, (y / sourceHeight) * (mask.height - 1)));
+  const x0 = Math.floor(px);
+  const y0 = Math.floor(py);
+  const x1 = Math.min(mask.width - 1, x0 + 1);
+  const y1 = Math.min(mask.height - 1, y0 + 1);
+  const tx = px - x0;
+  const ty = py - y0;
+  const top = maskPixel(mask, x0, y0) * (1 - tx) + maskPixel(mask, x1, y0) * tx;
+  const bottom = maskPixel(mask, x0, y1) * (1 - tx) + maskPixel(mask, x1, y1) * tx;
+  return top * (1 - ty) + bottom * ty;
 }
 
 function shouldUseNoiseInsideSvg(settings: NoiseSettings) {
@@ -424,6 +442,25 @@ function shouldUseNoiseInsideSvg(settings: NoiseSettings) {
 
 function isMaskedSource(settings: NoiseSettings) {
   return settings.source === 'svg' || settings.source === 'video' || settings.source === 'image';
+}
+
+function isSmallMaskedSvg(settings: NoiseSettings) {
+  return settings.source === 'svg' && Math.min(settings.width, settings.height) <= 160;
+}
+
+function maskedSourceThreshold(settings: NoiseSettings, useSvgNoiseField: boolean) {
+  if (!isMaskedSource(settings)) return 0.38 - settings.nodeDensity * 0.16;
+  if (useSvgNoiseField) return isSmallMaskedSvg(settings) ? 0.18 : 0.26;
+  if (isSmallMaskedSvg(settings)) return 0.24;
+  return 0.5;
+}
+
+function mapOverlayScale(settings: NoiseSettings) {
+  if (!isMaskedSource(settings)) return 8;
+  const smallestSide = Math.min(settings.width, settings.height);
+  if (smallestSide <= 240) return 1;
+  if (smallestSide <= 480) return 2;
+  return 4;
 }
 
 function sampleSourceField(seed: number, x: number, y: number, settings: NoiseSettings, mask: FieldMask | null, phase = 0) {
@@ -506,7 +543,8 @@ function buildPatternPool(settings: NoiseSettings, mask: FieldMask | null): Patt
   const seed = hashSeed(settings.seed);
   const random = rng(seed + 17);
   const nodes: PoolNode[] = [];
-  const spacing = 18 - settings.nodeDensity * 9;
+  const smallCanvasScale = Math.min(1, Math.max(0.32, Math.min(settings.width, settings.height) / 220));
+  const spacing = Math.max(2.6, (18 - settings.nodeDensity * 9) * smallCanvasScale);
   const jitter = spacing * (0.16 + settings.organicity * 0.26 - settings.angleBias * 0.06);
   const cell = spacing * 2.4;
   const buckets = new Map<string, number[]>();
@@ -1283,7 +1321,7 @@ function drawNoiseMapOverlay(canvas: HTMLCanvasElement | null, settings: NoiseSe
   if (!canvas) return;
   const context = canvas.getContext('2d');
   if (!context) return;
-  const scale = 8;
+  const scale = mapOverlayScale(settings);
   const width = Math.ceil(settings.width / scale);
   const height = Math.ceil(settings.height / scale);
 
@@ -1319,9 +1357,8 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   const connected = new Uint8Array(pool.nodes.length);
   const useSvgNoiseField = settings.source === 'svg' && shouldUseNoiseInsideSvg(settings);
   const useMediaMask = settings.source === 'video' || settings.source === 'image';
-  const threshold = isMaskedSource(settings)
-    ? (useSvgNoiseField ? 0.26 : 0.5)
-    : 0.38 - settings.nodeDensity * 0.16;
+  const smallMaskedSvg = isSmallMaskedSvg(settings);
+  const threshold = maskedSourceThreshold(settings, useSvgNoiseField);
   const lineVertices: number[] = [];
   const lineAlphas: number[] = [];
   const pathVertices: number[] = [];
@@ -1351,7 +1388,7 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
     const midpointWeight = useMediaMask
       ? sampleMask(mask, midpointX, midpointY)
       : morphValue(edge.baseWeight, edge.morphWeights, settings, phase);
-    if (midpointWeight < (isMaskedSource(settings) ? (useSvgNoiseField ? 0.24 : 0.5) : 0.22)) continue;
+    if (midpointWeight < (isMaskedSource(settings) ? Math.max(0.18, threshold - 0.02) : 0.22)) continue;
     if (edge.gate >= 0.16 + settings.connectionDensity * 0.46 + edge.angle * settings.angleBias * 0.24) continue;
     const desiredOrganicity = isMaskedSource(settings) ? settings.organicity * 1.25 : settings.organicity * 1.45;
     const organicity = maskedOrganicity(mask, settings, edge.a, edge.b, desiredOrganicity);
@@ -1433,7 +1470,7 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   }
 
   for (const node of pool.nodes) {
-    if (!active[node.id] || !connected[node.id]) continue;
+    if (!active[node.id] || (!connected[node.id] && !smallMaskedSvg)) continue;
     nodeVertices.push(node.x, node.y);
     nodeAlphas.push(0.52 + weights[node.id] * 0.48);
   }
@@ -1598,9 +1635,7 @@ function nearestTerrainNodeToPointer(
 ) {
   const seed = hashSeed(settings.seed);
   const useSvgNoiseField = settings.source === 'svg' && shouldUseNoiseInsideSvg(settings);
-  const threshold = isMaskedSource(settings)
-    ? (useSvgNoiseField ? 0.26 : 0.5)
-    : 0.38 - settings.nodeDensity * 0.16;
+  const threshold = maskedSourceThreshold(settings, useSvgNoiseField);
   let closest: PoolNode | null = null;
   let closestDistance = Infinity;
 
@@ -1776,9 +1811,7 @@ function renderTerrainWebgl(
 
   const seed = hashSeed(settings.seed);
   const useSvgNoiseField = settings.source === 'svg' && shouldUseNoiseInsideSvg(settings);
-  const threshold = isMaskedSource(settings)
-    ? (useSvgNoiseField ? 0.26 : 0.5)
-    : 0.38 - settings.nodeDensity * 0.16;
+  const threshold = maskedSourceThreshold(settings, useSvgNoiseField);
   const weights = new Float32Array(pool.nodes.length);
   const active = new Uint8Array(pool.nodes.length);
   const linePositions: number[] = [];
@@ -1807,7 +1840,7 @@ function renderTerrainWebgl(
     const midpointX = (edge.a.x + edge.b.x) * 0.5;
     const midpointY = (edge.a.y + edge.b.y) * 0.5;
     const midpointWeight = terrainWeight(seed, midpointX, midpointY, settings, mask, phase);
-    if (midpointWeight < (isMaskedSource(settings) ? (useSvgNoiseField ? 0.24 : 0.5) : 0.22)) continue;
+    if (midpointWeight < (isMaskedSource(settings) ? Math.max(0.18, threshold - 0.02) : 0.22)) continue;
     if (edge.gate >= 0.16 + settings.connectionDensity * 0.46 + edge.angle * settings.angleBias * 0.24) continue;
     pushTerrainPolyline(linePositions, lineColors, seed, edge.a, edge.b, settings, mask, phase, settings.organicity * 1.2, settings.terrainGlow * 0.1);
   }
@@ -1924,22 +1957,36 @@ async function loadSvgText(src: string) {
   return response.text();
 }
 
-function imageDataToMask(context: CanvasRenderingContext2D, width: number, height: number): FieldMask {
+function imageDataToMask(context: CanvasRenderingContext2D, width: number, height: number, sourceWidth = width, sourceHeight = height): FieldMask {
   return {
     width,
     height,
     pixels: context.getImageData(0, 0, width, height).data,
+    sourceWidth,
+    sourceHeight,
   };
+}
+
+function svgMaskRasterScale(settings: NoiseSettings) {
+  const smallestSide = Math.min(settings.width, settings.height);
+  if (smallestSide >= 480) return 1;
+  return Math.min(6, Math.max(2, Math.ceil(480 / Math.max(1, smallestSide))));
 }
 
 async function createSvg2dMask(settings: NoiseSettings): Promise<FieldMask | null> {
   if (settings.source !== 'svg' || !settings.svgDataUrl) return null;
   const image = await loadImage(settings.svgDataUrl);
+  const rasterScale = svgMaskRasterScale(settings);
+  const maskWidth = Math.max(1, Math.round(settings.width * rasterScale));
+  const maskHeight = Math.max(1, Math.round(settings.height * rasterScale));
   const canvas = document.createElement('canvas');
-  canvas.width = settings.width;
-  canvas.height = settings.height;
+  canvas.width = maskWidth;
+  canvas.height = maskHeight;
   const context = canvas.getContext('2d');
   if (!context) return null;
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = 'high';
+  context.scale(rasterScale, rasterScale);
 
   const sourceWidth = image.naturalWidth || settings.width;
   const sourceHeight = image.naturalHeight || settings.height;
@@ -1959,7 +2006,7 @@ async function createSvg2dMask(settings: NoiseSettings): Promise<FieldMask | nul
   context.fillRect(0, 0, settings.width, settings.height);
   context.globalCompositeOperation = 'source-over';
 
-  return imageDataToMask(context, settings.width, settings.height);
+  return imageDataToMask(context, maskWidth, maskHeight, settings.width, settings.height);
 }
 
 function svg3dMaskKey(settings: NoiseSettings) {
@@ -2592,7 +2639,7 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
       const height = Math.max(1, settings.height);
       const targetAspect = width / height;
       const containerAspect = bounds.width / Math.max(1, bounds.height);
-      const nextSize = containerAspect > targetAspect
+      const fittedSize = containerAspect > targetAspect
         ? {
             width: bounds.height * targetAspect,
             height: bounds.height,
@@ -2601,10 +2648,11 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
             width: bounds.width,
             height: bounds.width / targetAspect,
           };
+      const previewScale = Math.min(1, fittedSize.width / width, fittedSize.height / height);
 
       setPreviewSize((current) => {
-        const nextWidth = Math.round(nextSize.width);
-        const nextHeight = Math.round(nextSize.height);
+        const nextWidth = Math.round(width * previewScale);
+        const nextHeight = Math.round(height * previewScale);
         if (current?.width === nextWidth && current.height === nextHeight) return current;
         return { width: nextWidth, height: nextHeight };
       });

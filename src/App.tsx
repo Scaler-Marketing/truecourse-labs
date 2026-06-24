@@ -341,8 +341,8 @@ function createDialConfig(
       transparentBackground: false,
       exportPng: { type: 'action', label: 'Export PNG' },
       exportMp4: { type: 'action', label: 'Export MP4' },
-      width: slider(1440, 640, 2400, 10),
-      height: slider(900, 480, 1800, 10),
+      width: slider(1440, 32, 2400, 1),
+      height: slider(900, 32, 1800, 1),
     },
   };
 }
