@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { DialRoot, DialStore, useDialKit, type DialConfig } from 'dialkit';
 import 'dialkit/styles.css';
 import './App.css';
-import { NoiseCanvas, type GradientControlChange, type NoiseSettings, type PathWaypoint } from './components/NoiseCanvas';
+import { NoiseCanvas, type GradientControlChange, type NoiseSettings, type PathWaypoint, type TerrainCameraControlChange } from './components/NoiseCanvas';
 
 const defaultSeed = 'TC-48291';
 const minGradientStops = 2;
@@ -36,6 +36,11 @@ type LabControls = {
     loadSvg?: boolean;
     loadVideo?: boolean;
     loadImage?: boolean;
+    renderMode?: string;
+    terrainHeight?: number;
+    terrainDepth?: number;
+    terrainCoverage?: number;
+    terrainGlow?: number;
     size: number;
     complexity: number;
     contrast: number;
@@ -52,6 +57,15 @@ type LabControls = {
     organicity: number;
     nodeSize: number;
     lineWidth: number;
+  };
+  Camera?: {
+    positionX: number;
+    positionY: number;
+    positionZ: number;
+    targetX: number;
+    targetY: number;
+    targetZ: number;
+    fov: number;
   };
   Color?: GradientStopControlFields & {
     backgroundColor: string;
@@ -131,6 +145,7 @@ function createGradientStopControls(count: number) {
 
 function createDialConfig(
   bindingsSource: BindingsSource,
+  renderMode: 'flat' | 'terrain',
   svgNoiseEnabled: boolean,
   svgMode: SvgMode,
   videoDuration: number | null,
@@ -161,6 +176,22 @@ function createDialConfig(
           { value: 'image', label: 'Image' },
         ],
       },
+      renderMode: {
+        type: 'select',
+        default: renderMode,
+        options: [
+          { value: 'flat', label: 'Flat' },
+          { value: 'terrain', label: 'Terrain' },
+        ],
+      },
+      ...(renderMode === 'terrain'
+        ? {
+            terrainHeight: slider(0.55, 0, 1, 0.01),
+            terrainDepth: slider(1, 0.4, 2, 0.01),
+            terrainCoverage: slider(1, 0.75, 2.5, 0.01),
+            terrainGlow: slider(0.72, 0, 1, 0.01),
+          }
+        : {}),
       ...(bindingsSource === 'svg'
         ? {
             loadSvg: { type: 'action', label: 'Load SVG' },
@@ -197,6 +228,19 @@ function createDialConfig(
       nodeSize: slider(0.86, 0.2, 2.4, 0.02),
       lineWidth: slider(0.58, 0.12, 2.4, 0.02),
     },
+    ...(renderMode === 'terrain'
+      ? {
+          Camera: {
+            positionX: slider(0, -1.5, 1.5, 0.01),
+            positionY: slider(0.34, -0.2, 1.25, 0.01),
+            positionZ: slider(0.94, -0.5, 1.8, 0.01),
+            targetX: slider(0, -1.5, 1.5, 0.01),
+            targetY: slider(0.02, -0.35, 0.85, 0.01),
+            targetZ: slider(-0.18, -1.2, 1.2, 0.01),
+            fov: slider(42, 20, 75, 1),
+          },
+        }
+      : {}),
     Color: {
       backgroundColor: '#041426',
       colorMode: {
@@ -350,6 +394,7 @@ function createBindingsSettings(
 ): NoiseSettings {
   const bindings = controls.Bindings;
   const color = controls.Color;
+  const camera = controls.Camera;
   const svg = controls.SVG;
   const path = controls.Path;
   const motion = controls.Motion;
@@ -366,6 +411,7 @@ function createBindingsSettings(
   return {
     seed,
     source: bindings?.source === 'svg' ? 'svg' : bindings?.source === 'video' ? 'video' : bindings?.source === 'image' ? 'image' : 'noise',
+    renderMode: bindings?.renderMode === 'terrain' ? 'terrain' : 'flat',
     svgDataUrl,
     svgMode: svg?.mode === '3d' ? '3d' : '2d',
     svgNoiseEnabled: svg?.noise ?? false,
@@ -381,6 +427,17 @@ function createBindingsSettings(
     videoPositionX: bindings?.videoPositionX ?? 0,
     videoPositionY: bindings?.videoPositionY ?? 0,
     videoScale: bindings?.videoScale ?? 1,
+    terrainHeight: bindings?.terrainHeight ?? 0.55,
+    terrainDepth: bindings?.terrainDepth ?? 1,
+    terrainCoverage: bindings?.terrainCoverage ?? 1,
+    terrainGlow: bindings?.terrainGlow ?? 0.72,
+    terrainCameraPositionX: camera?.positionX ?? 0,
+    terrainCameraPositionY: camera?.positionY ?? 0.34,
+    terrainCameraPositionZ: camera?.positionZ ?? 0.94,
+    terrainCameraTargetX: camera?.targetX ?? 0,
+    terrainCameraTargetY: camera?.targetY ?? 0.02,
+    terrainCameraTargetZ: camera?.targetZ ?? -0.18,
+    terrainCameraFov: camera?.fov ?? 42,
     size: bindings?.size ?? svg?.size ?? 0.42,
     complexity: bindings?.complexity ?? svg?.complexity ?? 0.5,
     contrast: bindings?.contrast ?? svg?.contrast ?? 0.58,
@@ -426,6 +483,7 @@ function createBindingsSettings(
 
 function Lab() {
   const [bindingsSource, setBindingsSource] = useState<BindingsSource>('noise');
+  const [renderMode, setRenderMode] = useState<'flat' | 'terrain'>('flat');
   const [svgNoiseEnabled, setSvgNoiseEnabled] = useState(false);
   const [svgMode, setSvgMode] = useState<SvgMode>('2d');
   const [pathEnabled, setPathEnabled] = useState(true);
@@ -452,8 +510,8 @@ function Lab() {
     endY: 0.5,
   });
   const config = useMemo(
-    () => createDialConfig(bindingsSource, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode, gradientStopCount, gradientEditEnabled, colorMode, gradientType),
-    [bindingsSource, colorMode, gradientEditEnabled, gradientStopCount, gradientType, pathEnabled, pathMode, svgMode, svgNoiseEnabled, videoDuration],
+    () => createDialConfig(bindingsSource, renderMode, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode, gradientStopCount, gradientEditEnabled, colorMode, gradientType),
+    [bindingsSource, colorMode, gradientEditEnabled, gradientStopCount, gradientType, pathEnabled, pathMode, renderMode, svgMode, svgNoiseEnabled, videoDuration],
   );
   const panelName = 'TrueCourse Patterns';
 
@@ -483,6 +541,11 @@ function Lab() {
     },
   ) as unknown as LabControls;
 
+  const updateTerrainCameraControl = (change: TerrainCameraControlChange) => {
+    const panel = DialStore.getPanels().find((item) => item.name === panelName);
+    if (!panel) return;
+    DialStore.updateValue(panel.id, `Camera.${change.key}`, Number(change.value.toFixed(3)));
+  };
   const updateGradientControl = (change: GradientControlChange) => {
     if (change.type === 'gradient-start') {
       setGradientVector((value) => ({ ...value, startX: change.x, startY: change.y }));
@@ -503,6 +566,11 @@ function Lab() {
       setBindingsSource(nextSource);
     }
   }, [bindingsSource, controls.Bindings?.source]);
+
+  useEffect(() => {
+    const nextRenderMode = controls.Bindings?.renderMode === 'terrain' ? 'terrain' : 'flat';
+    if (nextRenderMode !== renderMode) setRenderMode(nextRenderMode);
+  }, [controls.Bindings?.renderMode, renderMode]);
 
   useEffect(() => {
     const nextColorMode = controls.Color?.colorMode === 'gradient' ? 'gradient' : 'solid';
@@ -643,6 +711,7 @@ function Lab() {
           pathEditEnabled={controls.Path?.edit ?? false}
           onPathPointsChange={setPathManualPoints}
           onGradientControlChange={updateGradientControl}
+          onTerrainCameraChange={updateTerrainCameraControl}
         />
       </section>
 
