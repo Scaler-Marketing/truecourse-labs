@@ -628,13 +628,27 @@ function PresetManageButton({ panelId, onManage }: PresetManageButtonProps) {
   const [toolbar, setToolbar] = useState<HTMLElement | null>(null);
 
   useEffect(() => {
+    let frame = 0;
+
     const findToolbar = () => {
-      setToolbar(document.querySelector<HTMLElement>('.control-rail .dialkit-panel-toolbar'));
+      const nextToolbar = document.querySelector<HTMLElement>('.control-rail .dialkit-panel-toolbar');
+      setToolbar((currentToolbar) => (currentToolbar === nextToolbar ? currentToolbar : nextToolbar));
+      return nextToolbar;
     };
 
+    const observer = new MutationObserver(() => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(findToolbar);
+    });
+
     findToolbar();
-    const frame = window.requestAnimationFrame(findToolbar);
-    return () => window.cancelAnimationFrame(frame);
+    observer.observe(document.body, { childList: true, subtree: true });
+    frame = window.requestAnimationFrame(findToolbar);
+
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
   }, []);
 
   if (!toolbar) return null;
