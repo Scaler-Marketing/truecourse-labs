@@ -17,6 +17,19 @@ export type PathWaypoint = {
   y: number;
 };
 
+export type CompositionPath = {
+  id: string;
+  name: string;
+  mode: 'auto' | 'manual';
+  points: PathWaypoint[];
+  enabled: boolean;
+};
+
+export type SelectedPathPoint = {
+  pathId: string;
+  index: number;
+};
+
 export type GradientStop = {
   color: string;
   position: number;
@@ -105,6 +118,9 @@ export type NoiseSettings = {
   pathEnabled: boolean;
   pathMode: 'auto' | 'manual';
   pathManualPoints: PathWaypoint[];
+  paths: CompositionPath[];
+  activePathId: string;
+  selectedPathPoint: SelectedPathPoint | null;
   pathSnapRadius: number;
   pathThickness: number;
   pathEndpointSpread: number;
@@ -156,7 +172,9 @@ type PatternPool = {
   edges: PoolEdge[];
   pathEdges: Set<number>;
   pathConnections: PathConnection[];
+  activePathConnections: PathConnection[];
   pathPointIds: Set<number>;
+  selectedPathPointId: number | null;
 };
 
 type FrameGeometry = {
@@ -164,8 +182,12 @@ type FrameGeometry = {
   lineAlphas: number[];
   pathVertices: number[];
   pathAlphas: number[];
+  activePathVertices: number[];
+  activePathAlphas: number[];
   pathPointVertices: number[];
   pathPointAlphas: number[];
+  selectedPathPointVertices: number[];
+  selectedPathPointAlphas: number[];
   nodeVertices: number[];
   nodeAlphas: number[];
   stubVertices: number[];
@@ -630,10 +652,12 @@ function buildPatternPool(settings: NoiseSettings, mask: FieldMask | null): Patt
     }
   }
 
-  const path = settings.pathEnabled ? findPoolPath(nodes, edges, settings) : {
+  const path = settings.pathEnabled ? findPoolPaths(nodes, edges, settings) : {
     edges: new Set<number>(),
     connections: [] as PathConnection[],
+    activeConnections: [] as PathConnection[],
     pointIds: new Set<number>(),
+    selectedPointId: null as number | null,
   };
 
   return {
@@ -641,7 +665,9 @@ function buildPatternPool(settings: NoiseSettings, mask: FieldMask | null): Patt
     edges,
     pathEdges: path.edges,
     pathConnections: path.connections,
+    activePathConnections: path.activeConnections,
     pathPointIds: path.pointIds,
+    selectedPathPointId: path.selectedPointId,
   };
 }
 
@@ -693,8 +719,9 @@ function createPatternPoolKey(settings: NoiseSettings) {
     angleBias: settings.angleBias,
     organicity: settings.organicity,
     pathEnabled: settings.pathEnabled,
-    pathMode: settings.pathMode,
-    pathManualPoints: settings.pathManualPoints,
+    paths: settings.paths,
+    activePathId: settings.activePathId,
+    selectedPathPoint: settings.selectedPathPoint,
     pathEndpointSpread: settings.pathEndpointSpread,
     motionEnabled: settings.motionEnabled,
     width: settings.width,
@@ -745,13 +772,15 @@ function getCachedFrameGeometry(
   return frame;
 }
 
-function chooseEndpoints(nodes: PoolNode[], settings: NoiseSettings) {
+function chooseEndpoints(nodes: PoolNode[], settings: NoiseSettings, laneIndex = 0, laneCount = 1) {
   if (nodes.length < 2) return null;
   const horizontal = settings.width >= settings.height;
   const majorSize = horizontal ? settings.width : settings.height;
   const crossSize = horizontal ? settings.height : settings.width;
   const majorMargin = majorSize * (0.04 + (1 - settings.pathEndpointSpread) * 0.18);
-  const crossCenter = crossSize * 0.5;
+  const laneT = laneCount > 1 ? laneIndex / Math.max(1, laneCount - 1) : 0.5;
+  const laneOffset = (laneT - 0.5) * crossSize * 0.42 * settings.pathEndpointSpread;
+  const crossCenter = crossSize * 0.5 + laneOffset;
   const crossLimit = crossSize * (0.18 + settings.pathEndpointSpread * 0.24);
   const marginX = horizontal ? majorMargin : settings.width * 0.08;
   const marginY = horizontal ? settings.height * 0.08 : majorMargin;
@@ -938,24 +967,58 @@ function orderedConnectionsFromEdges(edges: PoolEdge[], orderedEdges: number[]) 
   });
 }
 
-function findPoolPath(nodes: PoolNode[], edges: PoolEdge[], settings: NoiseSettings) {
+type RoutedPathResult = {
+  edges: Set<number>;
+  connections: PathConnection[];
+  activeConnections: PathConnection[];
+  pointIds: Set<number>;
+  selectedPointId: number | null;
+};
+
+function emptyRoutedPath(): RoutedPathResult {
+  return {
+    edges: new Set<number>(),
+    connections: [],
+    activeConnections: [],
+    pointIds: new Set<number>(),
+    selectedPointId: null,
+  };
+}
+
+function routePoolPath(
+  nodes: PoolNode[],
+  edges: PoolEdge[],
+  settings: NoiseSettings,
+  path: CompositionPath,
+  autoIndex: number,
+  autoCount: number,
+): RoutedPathResult {
   const pointIds = new Set<number>();
-  const manualNodes = settings.pathMode === 'manual'
-    ? settings.pathManualPoints
-      .map((point) => nearestNodeToWaypoint(nodes, point, settings))
-      .filter((node): node is PoolNode => Boolean(node))
-      .filter((node, index, list) => list.findIndex((item) => item.id === node.id) === index)
+  const manualPointNodes = path.mode === 'manual'
+    ? path.points.map((point, index) => ({
+        index,
+        node: nearestNodeToWaypoint(nodes, point, settings),
+      })).filter((item): item is { index: number; node: PoolNode } => Boolean(item.node))
     : [];
+  const manualNodes = manualPointNodes
+    .map((item) => item.node)
+    .filter((node, index, list) => list.findIndex((item) => item.id === node.id) === index);
   for (const node of manualNodes) pointIds.add(node.id);
+
+  const selectedPointId = settings.selectedPathPoint?.pathId === path.id
+    ? manualPointNodes.find((item) => item.index === settings.selectedPathPoint?.index)?.node.id ?? null
+    : null;
 
   let routeNodes = manualNodes;
   if (routeNodes.length === 0) {
-    const endpoints = chooseEndpoints(nodes, settings);
+    const endpoints = chooseEndpoints(nodes, settings, autoIndex, autoCount);
     if (!endpoints) {
       return {
         edges: new Set<number>(),
         connections: fallbackPathConnections(settings),
+        activeConnections: [],
         pointIds,
+        selectedPointId,
       };
     }
     routeNodes = endpoints;
@@ -968,7 +1031,9 @@ function findPoolPath(nodes: PoolNode[], edges: PoolEdge[], settings: NoiseSetti
     return {
       edges: new Set<number>(),
       connections: fallbackPathConnections(settings),
+      activeConnections: [],
       pointIds,
+      selectedPointId,
     };
   }
 
@@ -989,16 +1054,38 @@ function findPoolPath(nodes: PoolNode[], edges: PoolEdge[], settings: NoiseSetti
       });
     }
   }
-  const path = new Set(orderedEdges);
-  const connections = [...orderedConnectionsFromEdges(edges, orderedEdges), ...directConnections];
 
+  const pathEdges = new Set(orderedEdges);
+  const connections = [...orderedConnectionsFromEdges(edges, orderedEdges), ...directConnections];
   return {
-    edges: path,
+    edges: pathEdges,
     connections: connections.length ? connections : fallbackPathConnections(settings),
+    activeConnections: [],
     pointIds,
+    selectedPointId,
   };
 }
 
+function findPoolPaths(nodes: PoolNode[], edges: PoolEdge[], settings: NoiseSettings): RoutedPathResult {
+  const enabledPaths = settings.paths.filter((path) => path.enabled);
+  if (!enabledPaths.length) return emptyRoutedPath();
+
+  const autoPaths = enabledPaths.filter((path) => path.mode === 'auto' || path.points.length === 0);
+  const combined = emptyRoutedPath();
+  for (const path of enabledPaths) {
+    const autoIndex = Math.max(0, autoPaths.findIndex((item) => item.id === path.id));
+    const routed = routePoolPath(nodes, edges, settings, path, autoIndex, Math.max(1, autoPaths.length));
+    routed.edges.forEach((edgeId) => combined.edges.add(edgeId));
+    routed.pointIds.forEach((pointId) => combined.pointIds.add(pointId));
+    if (path.id === settings.activePathId) {
+      combined.activeConnections.push(...routed.connections);
+    } else {
+      combined.connections.push(...routed.connections);
+    }
+    if (routed.selectedPointId !== null) combined.selectedPointId = routed.selectedPointId;
+  }
+  return combined;
+}
 function createGlBundle(canvas: HTMLCanvasElement): GlBundle | null {
   let renderer: THREE.WebGLRenderer;
   try {
@@ -1363,8 +1450,12 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
   const lineAlphas: number[] = [];
   const pathVertices: number[] = [];
   const pathAlphas: number[] = [];
+  const activePathVertices: number[] = [];
+  const activePathAlphas: number[] = [];
   const pathPointVertices: number[] = [];
   const pathPointAlphas: number[] = [];
+  const selectedPathPointVertices: number[] = [];
+  const selectedPathPointAlphas: number[] = [];
   const nodeVertices: number[] = [];
   const nodeAlphas: number[] = [];
   const stubVertices: number[] = [];
@@ -1431,6 +1522,21 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
     }
   }
 
+  for (const connection of pool.activePathConnections) {
+    const desiredOrganicity = isMaskedSource(settings) ? settings.organicity * 1.05 : settings.organicity * 0.95;
+    const organicity = isMaskedSource(settings)
+      ? maskedOrganicity(mask, settings, connection.a, connection.b, desiredOrganicity)
+      : desiredOrganicity;
+    if (organicity === null) continue;
+    pushConnection(
+      activePathVertices,
+      activePathAlphas,
+      connection.a,
+      connection.b,
+      0.92 + Math.max(0, Math.min(1, connection.weight)) * 0.08,
+      organicity,
+    );
+  }
   for (const nodeId of pool.pathPointIds) {
     const node = pool.nodes[nodeId];
     if (!node) continue;
@@ -1439,6 +1545,14 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
     active[node.id] = 1;
     connected[node.id] = 1;
     weights[node.id] = Math.max(weights[node.id], 0.84);
+  }
+
+  if (pool.selectedPathPointId !== null) {
+    const node = pool.nodes[pool.selectedPathPointId];
+    if (node) {
+      selectedPathPointVertices.push(node.x, node.y);
+      selectedPathPointAlphas.push(1);
+    }
   }
 
   const stubChance = 0.015 + settings.organicity * 0.075;
@@ -1480,8 +1594,12 @@ function buildFrameGeometry(pool: PatternPool, settings: NoiseSettings, phase: n
     lineAlphas,
     pathVertices,
     pathAlphas,
+    activePathVertices,
+    activePathAlphas,
     pathPointVertices,
     pathPointAlphas,
+    selectedPathPointVertices,
+    selectedPathPointAlphas,
     nodeVertices,
     nodeAlphas,
     stubVertices,
@@ -1520,7 +1638,9 @@ function renderWebgl(
   drawVertices(bundle, frame.lineVertices, frame.lineAlphas, 'lines', hexToRgba(settings.foregroundColor, 0.9), settings, true, settings.lineWidth);
   drawVertices(bundle, frame.stubVertices, frame.stubAlphas, 'lines', hexToRgba(settings.foregroundColor, 0.72), settings, true, settings.lineWidth * 0.82);
   drawVertices(bundle, frame.pathVertices, frame.pathAlphas, 'lines', hexToRgba(settings.pathColor, 0.96), settings, false, settings.pathThickness);
+  drawVertices(bundle, frame.activePathVertices, frame.activePathAlphas, 'lines', hexToRgba('#8FFFD2', 1), settings, false, settings.pathThickness);
   drawVertices(bundle, frame.pathPointVertices, frame.pathPointAlphas, 'points', hexToRgba(settings.pathColor, 1), settings, false, Math.max(5.5, settings.pathThickness * 2.6));
+  drawVertices(bundle, frame.selectedPathPointVertices, frame.selectedPathPointAlphas, 'points', hexToRgba('#FFD66E', 1), settings, false, Math.max(8, settings.pathThickness * 3.6));
   drawVertices(bundle, frame.nodeVertices, frame.nodeAlphas, 'points', hexToRgba(settings.foregroundColor, 1), settings, true, Math.max(1.2, settings.nodeSize * 2.3));
   drawVertices(bundle, frame.stubNodeVertices, frame.stubNodeAlphas, 'points', hexToRgba(settings.foregroundColor, 0.88), settings, true, Math.max(1, settings.nodeSize * 1.45));
 }
@@ -1822,6 +1942,10 @@ function renderTerrainWebgl(
   const pointColors: number[] = [];
   const pathPointPositions: number[] = [];
   const pathPointColors: number[] = [];
+  const activePathPositions: number[] = [];
+  const activePathColors: number[] = [];
+  const selectedPathPointPositions: number[] = [];
+  const selectedPathPointColors: number[] = [];
 
   for (const node of pool.nodes) {
     const weight = terrainWeight(seed, node.x, node.y, settings, mask, phase);
@@ -1849,12 +1973,24 @@ function renderTerrainWebgl(
     pushTerrainPolyline(pathPositions, pathColors, seed, connection.a, connection.b, settings, mask, phase, settings.organicity * 0.9, 0.55 + settings.terrainGlow * 0.35, settings.pathColor);
   }
 
+  for (const connection of pool.activePathConnections) {
+    pushTerrainPolyline(activePathPositions, activePathColors, seed, connection.a, connection.b, settings, mask, phase, settings.organicity * 0.9, 0.72 + settings.terrainGlow * 0.28, '#8FFFD2');
+  }
   for (const nodeId of pool.pathPointIds) {
     const node = pool.nodes[nodeId];
     if (!node) continue;
     const point = terrainPoint(seed, node.x, node.y, settings, mask, phase);
     pathPointPositions.push(point.x, point.y + 2, point.z);
     pathPointColors.push(...terrainSolidColor(settings.pathColor, point.weight, 0.75));
+  }
+
+  if (pool.selectedPathPointId !== null) {
+    const node = pool.nodes[pool.selectedPathPointId];
+    if (node) {
+      const point = terrainPoint(seed, node.x, node.y, settings, mask, phase);
+      selectedPathPointPositions.push(point.x, point.y + 4, point.z);
+      selectedPathPointColors.push(...terrainSolidColor('#FFD66E', point.weight, 0.9));
+    }
   }
 
   const makeLineObject = (positions: number[], colors: number[], opacity: number) => {
@@ -1895,7 +2031,9 @@ function renderTerrainWebgl(
     makeLineObject(linePositions, lineColors, 0.38 + settings.terrainGlow * 0.28),
     makePointObject(pointPositions, pointColors, Math.max(2.5, settings.nodeSize * 8), 0.6 + settings.terrainGlow * 0.28),
     makeLineObject(pathPositions, pathColors, 0.82),
+    makeLineObject(activePathPositions, activePathColors, 0.98),
     makePointObject(pathPointPositions, pathPointColors, Math.max(8, settings.pathThickness * 8), 0.95),
+    makePointObject(selectedPathPointPositions, selectedPathPointColors, Math.max(11, settings.pathThickness * 10), 1),
   ].filter(Boolean) as THREE.Object3D[];
 
   for (const object of objects) bundle.scene.add(object);
@@ -2426,6 +2564,7 @@ type NoiseCanvasProps = {
   settings: NoiseSettings;
   pathEditEnabled?: boolean;
   onPathPointsChange?: Dispatch<SetStateAction<PathWaypoint[]>>;
+  onSelectedPathPointChange?: Dispatch<SetStateAction<SelectedPathPoint | null>>;
   onGradientControlChange?: (change: GradientControlChange) => void;
   onTerrainCameraChange?: (change: TerrainCameraControlChange) => void;
 };
@@ -2469,7 +2608,7 @@ function gradientHandlePoints(settings: NoiseSettings) {
   return { start, end, stops };
 }
 
-export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsChange, onGradientControlChange, onTerrainCameraChange }: NoiseCanvasProps) {
+export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsChange, onSelectedPathPointChange, onGradientControlChange, onTerrainCameraChange }: NoiseCanvasProps) {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLCanvasElement | null>(null);
@@ -2494,7 +2633,8 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
   terrainCameraChangeRef.current = onTerrainCameraChange;
 
   const handlePathPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (!pathEditEnabled || settings.pathMode !== 'manual' || !settings.pathEnabled || !onPathPointsChange) return;
+    const activePath = settings.paths.find((path) => path.id === settings.activePathId);
+    if (!pathEditEnabled || !activePath || activePath.mode !== 'manual' || !settings.pathEnabled || !onPathPointsChange) return;
     const pool = poolRef.current;
     const canvas = canvasRef.current;
     if (!pool?.nodes.length || !canvas) return;
@@ -2529,30 +2669,54 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
     const shouldRemove = event.button === 2 || event.altKey || event.shiftKey;
 
     onPathPointsChange((points) => {
-      if (shouldRemove) {
-        let removeIndex = -1;
-        let removeDistance = Infinity;
-        for (let index = 0; index < points.length; index += 1) {
-          const distance = Math.hypot(
-            points[index].x * settings.width - closest.x,
-            points[index].y * settings.height - closest.y,
-          );
-          if (distance < removeDistance) {
-            removeDistance = distance;
-            removeIndex = index;
-          }
+      let closestPointIndex = -1;
+      let closestPointDistance = Infinity;
+      for (let index = 0; index < points.length; index += 1) {
+        const distance = Math.hypot(
+          points[index].x * settings.width - closest.x,
+          points[index].y * settings.height - closest.y,
+        );
+        if (distance < closestPointDistance) {
+          closestPointDistance = distance;
+          closestPointIndex = index;
         }
-        if (removeIndex === -1 || removeDistance > settings.pathSnapRadius * 1.6) return points;
-        return points.filter((_, index) => index !== removeIndex);
+      }
+      const hasPointHit = closestPointIndex !== -1 && closestPointDistance <= settings.pathSnapRadius * 1.6;
+
+      if (shouldRemove) {
+        if (!hasPointHit) return points;
+        onSelectedPathPointChange?.(null);
+        return points.filter((_, index) => index !== closestPointIndex);
+      }
+
+      if (hasPointHit) {
+        onSelectedPathPointChange?.({ pathId: activePath.id, index: closestPointIndex });
+        return points;
       }
 
       const duplicate = points.some((point) => (
         Math.hypot(point.x * settings.width - closest.x, point.y * settings.height - closest.y) <= settings.pathSnapRadius * 0.8
       ));
-      return duplicate ? points : [...points, waypoint];
+      if (duplicate) return points;
+      onSelectedPathPointChange?.({ pathId: activePath.id, index: points.length });
+      return [...points, waypoint];
     });
   };
-
+  useEffect(() => {
+    if (!pathEditEnabled || !onPathPointsChange || !settings.selectedPathPoint) return undefined;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Delete' && event.key !== 'Backspace') return;
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return;
+      if (settings.selectedPathPoint?.pathId !== settings.activePathId) return;
+      event.preventDefault();
+      const removeIndex = settings.selectedPathPoint.index;
+      onPathPointsChange((points) => points.filter((_, index) => index !== removeIndex));
+      onSelectedPathPointChange?.(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onPathPointsChange, onSelectedPathPointChange, pathEditEnabled, settings.activePathId, settings.selectedPathPoint]);
   const handlePathContextMenu = (event: ReactMouseEvent<HTMLCanvasElement>) => {
     if (!pathEditEnabled || settings.pathMode !== 'manual') return;
     event.preventDefault();
@@ -2941,3 +3105,4 @@ export function NoiseCanvas({ settings, pathEditEnabled = false, onPathPointsCha
     </div>
   );
 }
+

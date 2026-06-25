@@ -386,3 +386,132 @@
   font-size: 13px;
   text-align: center;
 }
+.path-manager-mount {
+  display: block;
+}
+
+.path-manager {
+  display: grid;
+  gap: 7px;
+  padding: 7px 0 2px;
+}
+
+.path-manager-header,
+.path-manager-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.path-manager-header {
+  padding: 0 2px;
+  color: rgba(238, 245, 255, 0.62);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.path-add-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 8px;
+  color: rgba(238, 245, 255, 0.82);
+  background: rgba(255, 255, 255, 0.065);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.path-add-button:hover {
+  color: rgba(255, 255, 255, 0.96);
+  background: rgba(255, 255, 255, 0.11);
+}
+
+.path-list {
+  display: grid;
+  gap: 5px;
+}
+
+.path-list-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  gap: 5px;
+  align-items: center;
+}
+
+.path-row-select {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 34px;
+  padding: 0 9px;
+  color: rgba(238, 245, 255, 0.78);
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+}
+
+.path-list-row[data-active="true"] .path-row-select {
+  color: rgba(255, 255, 255, 0.96);
+  background: rgba(125, 178, 255, 0.14);
+  border-color: rgba(125, 178, 255, 0.34);
+}
+
+.path-row-select span,
+.path-row-select small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-row-select small {
+  color: rgba(238, 245, 255, 0.48);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.path-list-row[data-active="true"] .path-row-select small {
+  color: rgba(143, 255, 210, 0.78);
+}
+
+.path-icon-button {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  color: rgba(238, 245, 255, 0.72);
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.path-icon-button:hover:not(:disabled) {
+  color: rgba(255, 255, 255, 0.96);
+  background: rgba(255, 255, 255, 0.11);
+}
+
+.path-icon-button:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.path-manager-meta {
+  padding: 0 2px;
+  color: rgba(238, 245, 255, 0.5);
+  font-size: 11px;
+}
+

@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { DialRoot, DialStore, useDialKit, type DialConfig, type DialValue, type Preset } from 'dialkit';
-import { Check, Pencil, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { Check, Pencil, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import 'dialkit/styles.css';
 import './App.css';
-import { NoiseCanvas, type GradientControlChange, type NoiseSettings, type PathWaypoint, type TerrainCameraControlChange } from './components/NoiseCanvas';
+import { NoiseCanvas, type CompositionPath, type GradientControlChange, type NoiseSettings, type PathWaypoint, type SelectedPathPoint, type TerrainCameraControlChange } from './components/NoiseCanvas';
 
 const defaultSeed = 'TC-48291';
 const minGradientStops = 2;
@@ -116,6 +116,15 @@ type LabControls = {
   };
 };
 
+function createDefaultPath(index: number): CompositionPath {
+  return {
+    id: `path-${Date.now().toString(36)}-${index.toString(36)}`,
+    name: `Path ${index}`,
+    mode: index === 1 ? 'auto' : 'manual',
+    points: [],
+    enabled: true,
+  };
+}
 function randomSeed() {
   return `TC-${Math.floor(10000 + Math.random() * 89999)}`;
 }
@@ -507,7 +516,9 @@ function createBindingsSettings(
   videoDataUrl: string | null,
   imageDataUrl: string | null,
   videoDuration: number | null,
-  pathManualPoints: PathWaypoint[],
+  paths: CompositionPath[],
+  activePathId: string,
+  selectedPathPoint: SelectedPathPoint | null,
   gradientStopCount: number,
   gradientEditEnabled: boolean,
   colorMode: 'solid' | 'gradient',
@@ -521,6 +532,7 @@ function createBindingsSettings(
   const path = controls.Path;
   const motion = controls.Motion;
   const exportControls = controls.Export;
+  const activePath = paths.find((item) => item.id === activePathId) ?? paths[0];
   const gradientStops = Array.from({ length: gradientStopCount }, (_, index) => {
     const number = index + 1 as GradientStopIndex;
     const defaults = defaultGradientStops[index];
@@ -584,8 +596,11 @@ function createBindingsSettings(
     gradientRadius: Math.hypot(gradientVector.endX - gradientVector.startX, gradientVector.endY - gradientVector.startY),
     gradientStops,
     pathEnabled: path?.enabled ?? true,
-    pathMode: path?.mode === 'manual' ? 'manual' : 'auto',
-    pathManualPoints,
+    pathMode: activePath?.mode ?? (path?.mode === 'manual' ? 'manual' : 'auto'),
+    pathManualPoints: activePath?.points ?? [],
+    paths,
+    activePathId: activePath?.id ?? activePathId,
+    selectedPathPoint,
     pathSnapRadius: path?.snapRadius ?? 18,
     pathThickness: path?.thickness ?? 1.35,
     pathEndpointSpread: path?.endpointSpread ?? 0.72,
@@ -771,7 +786,10 @@ function Lab() {
   const [svgNoiseEnabled, setSvgNoiseEnabled] = useState(false);
   const [svgMode, setSvgMode] = useState<SvgMode>('2d');
   const [pathEnabled, setPathEnabled] = useState(true);
-  const [pathMode, setPathMode] = useState<'auto' | 'manual'>('auto');
+  const [paths, setPaths] = useState<CompositionPath[]>(() => [createDefaultPath(1)]);
+  const [activePathId, setActivePathId] = useState(() => paths[0]?.id ?? 'path-1');
+  const [selectedPathPoint, setSelectedPathPoint] = useState<SelectedPathPoint | null>(null);
+  const [pathManagerHost, setPathManagerHost] = useState<HTMLElement | null>(null);
   const svgInputRef = useRef<HTMLInputElement | null>(null);
   const videoInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -782,7 +800,6 @@ function Lab() {
   const [nonce, setNonce] = useState(0);
   const [pendingExport, setPendingExport] = useState(false);
   const [videoExportNonce, setVideoExportNonce] = useState(0);
-  const [pathManualPoints, setPathManualPoints] = useState<PathWaypoint[]>([]);
   const [gradientStopCount, setGradientStopCount] = useState(4);
   const [gradientEditEnabled, setGradientEditEnabled] = useState(false);
   const [colorMode, setColorMode] = useState<'solid' | 'gradient'>('solid');
@@ -793,9 +810,11 @@ function Lab() {
     endX: 1,
     endY: 0.5,
   });
+  const activePath = paths.find((path) => path.id === activePathId) ?? paths[0];
+  const activePathMode = activePath?.mode ?? 'auto';
   const config = useMemo(
-    () => createDialConfig(bindingsSource, renderMode, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, pathMode, gradientStopCount, gradientEditEnabled, colorMode, gradientType),
-    [bindingsSource, colorMode, gradientEditEnabled, gradientStopCount, gradientType, pathEnabled, pathMode, renderMode, svgMode, svgNoiseEnabled, videoDuration],
+    () => createDialConfig(bindingsSource, renderMode, svgNoiseEnabled, svgMode, videoDuration, pathEnabled, activePathMode, gradientStopCount, gradientEditEnabled, colorMode, gradientType),
+    [activePathMode, bindingsSource, colorMode, gradientEditEnabled, gradientStopCount, gradientType, pathEnabled, renderMode, svgMode, svgNoiseEnabled, videoDuration],
   );
   const panelName = 'TrueCourse Patterns';
   const [presetRevision, setPresetRevision] = useState(0);
@@ -875,7 +894,10 @@ function Lab() {
         if (action === 'Color.toggleGradientEdit' || action === 'toggleGradientEdit') setGradientEditEnabled((value) => !value);
         if (action === 'Color.addStop' || action === 'addStop') setGradientStopCount((value) => Math.min(maxGradientStops, value + 1));
         if (action === 'Color.removeStop' || action === 'removeStop') setGradientStopCount((value) => Math.max(minGradientStops, value - 1));
-        if (action === 'Path.clearPoints' || action === 'clearPoints') setPathManualPoints([]);
+        if (action === 'Path.clearPoints' || action === 'clearPoints') {
+          setPaths((items) => items.map((item) => (item.id === activePathId ? { ...item, points: [] } : item)));
+          setSelectedPathPoint(null);
+        }
         if (action === 'Export.exportPng' || action === 'exportPng') setPendingExport(true);
         if (action === 'Export.exportMp4' || action === 'exportMp4') setVideoExportNonce((value) => value + 1);
       },
@@ -945,8 +967,9 @@ function Lab() {
 
   useEffect(() => {
     const nextPathMode = controls.Path?.mode === 'manual' ? 'manual' : 'auto';
-    if (nextPathMode !== pathMode) setPathMode(nextPathMode);
-  }, [controls.Path?.mode, pathMode]);
+    setPaths((items) => items.map((item) => (item.id === activePathId && item.mode !== nextPathMode ? { ...item, mode: nextPathMode } : item)));
+    if (nextPathMode !== 'manual') setSelectedPathPoint(null);
+  }, [activePathId, controls.Path?.mode]);
 
   useEffect(() => {
     if (bindingsSource !== 'video' || !videoDuration) return;
@@ -977,8 +1000,8 @@ function Lab() {
 
   const settings = useMemo<NoiseSettings>(() => {
     const seed = `${controls.seed ?? defaultSeed}:${nonce}`;
-    return createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, imageDataUrl, videoDuration, pathManualPoints, gradientStopCount, gradientEditEnabled, colorMode, gradientType, gradientVector);
-  }, [colorMode, controls, gradientEditEnabled, gradientStopCount, gradientType, gradientVector, imageDataUrl, nonce, pathManualPoints, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
+    return createBindingsSettings(controls, seed, videoExportNonce, svgDataUrl, videoDataUrl, imageDataUrl, videoDuration, paths, activePathId, selectedPathPoint, gradientStopCount, gradientEditEnabled, colorMode, gradientType, gradientVector);
+  }, [activePathId, colorMode, controls, gradientEditEnabled, gradientStopCount, gradientType, gradientVector, imageDataUrl, nonce, paths, selectedPathPoint, svgDataUrl, videoDataUrl, videoDuration, videoExportNonce]);
 
   const debouncedSettings = useDebouncedValue(settings, 35);
 
@@ -1014,6 +1037,102 @@ function Lab() {
   const requestPresetRename = (panelId: string, presetId: string) => {
     setPresetModal({ mode: 'rename', panelId, presetId });
   };
+  const setActivePathPoints = (update: PathWaypoint[] | ((points: PathWaypoint[]) => PathWaypoint[])) => {
+    setPaths((items) => items.map((item) => {
+      if (item.id !== activePathId) return item;
+      const nextPoints = typeof update === 'function' ? update(item.points) : update;
+      return { ...item, points: nextPoints };
+    }));
+  };
+
+  const updateDialPathMode = (mode: 'auto' | 'manual') => {
+    const panel = DialStore.getPanels().find((item) => item.name === panelName);
+    if (panel) DialStore.updateValue(panel.id, 'Path.mode', mode);
+  };
+
+  const selectPath = (pathId: string) => {
+    const nextPath = paths.find((item) => item.id === pathId);
+    if (!nextPath) return;
+    setActivePathId(pathId);
+    setSelectedPathPoint(null);
+    updateDialPathMode(nextPath.mode);
+  };
+
+  const addPath = () => {
+    const nextPath = createDefaultPath(paths.length + 1);
+    setPaths((items) => [...items, nextPath]);
+    setActivePathId(nextPath.id);
+    setSelectedPathPoint(null);
+    updateDialPathMode(nextPath.mode);
+  };
+
+  const deletePath = (pathId: string) => {
+    if (paths.length <= 1) return;
+    const activeIndex = paths.findIndex((item) => item.id === pathId);
+    const nextItems = paths.filter((item) => item.id !== pathId);
+    setPaths(nextItems);
+    if (pathId === activePathId) {
+      const nextPath = nextItems[Math.max(0, Math.min(activeIndex, nextItems.length - 1))];
+      if (nextPath) {
+        setActivePathId(nextPath.id);
+        updateDialPathMode(nextPath.mode);
+      }
+      setSelectedPathPoint(null);
+    } else if (selectedPathPoint?.pathId === pathId) {
+      setSelectedPathPoint(null);
+    }
+  };
+
+  useEffect(() => {
+    let frame = 0;
+    let timeout = 0;
+    let observer: MutationObserver | null = null;
+    let attempts = 0;
+
+    const mountPathManager = () => {
+      const rail = document.querySelector<HTMLElement>('.control-rail');
+      const folders = Array.from(document.querySelectorAll<HTMLElement>('.control-rail .dialkit-folder'));
+      const pathFolder = folders.find((folder) => folder.querySelector('.dialkit-folder-title')?.textContent?.trim() === 'Path');
+      const pathInner = pathFolder?.querySelector<HTMLElement>(':scope > .dialkit-folder-content > .dialkit-folder-inner');
+
+      if (!pathInner) {
+        attempts += 1;
+        if (attempts < 20) timeout = window.setTimeout(mountPathManager, 50);
+        if (rail && !observer) {
+          observer = new MutationObserver(mountPathManager);
+          observer.observe(rail, { childList: true, subtree: true });
+        }
+        return;
+      }
+
+      let mount = pathInner.querySelector<HTMLElement>(':scope > .path-manager-mount');
+      if (!mount) {
+        mount = document.createElement('div');
+        mount.className = 'path-manager-mount';
+      }
+
+      const rows = Array.from(pathInner.children) as HTMLElement[];
+      const anchor = rows.find((row) => row.textContent?.trim() === 'Clear Points')
+        ?? rows.find((row) => row.textContent?.trim().startsWith('Mode'));
+      if (anchor?.nextSibling !== mount) {
+        pathInner.insertBefore(mount, anchor ? anchor.nextSibling : pathInner.firstChild);
+      }
+      if (!observer) {
+        observer = new MutationObserver(() => {
+          window.requestAnimationFrame(mountPathManager);
+        });
+        observer.observe(pathInner, { childList: true });
+      }
+      setPathManagerHost(mount);
+    };
+
+    frame = window.requestAnimationFrame(mountPathManager);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+      observer?.disconnect();
+    };
+  }, [activePathMode, pathEnabled]);
 
   return (
     <main className="app-shell">
@@ -1072,7 +1191,8 @@ function Lab() {
         <NoiseCanvas
           settings={debouncedSettings}
           pathEditEnabled={controls.Path?.edit ?? false}
-          onPathPointsChange={setPathManualPoints}
+          onPathPointsChange={setActivePathPoints}
+          onSelectedPathPointChange={setSelectedPathPoint}
           onGradientControlChange={updateGradientControl}
           onTerrainCameraChange={updateTerrainCameraControl}
         />
@@ -1080,6 +1200,45 @@ function Lab() {
 
       <aside className="control-rail">
         <DialRoot mode="inline" theme="dark" productionEnabled />
+        {pathManagerHost ? createPortal(
+          <div className="path-manager">
+            <div className="path-manager-header">
+              <span>Paths</span>
+              <button className="path-add-button" type="button" onClick={addPath} title="Add path" aria-label="Add path">
+                <Plus size={14} />
+                Add
+              </button>
+            </div>
+            <div className="path-list">
+              {paths.map((path) => {
+                const isActive = path.id === activePathId;
+                const detail = path.mode === 'manual' ? `${path.points.length} dots` : 'Auto route';
+                return (
+                  <div className="path-list-row" data-active={isActive} key={path.id}>
+                    <button className="path-row-select" type="button" onClick={() => selectPath(path.id)} aria-pressed={isActive}>
+                      <span>{path.name}</span>
+                      <small>{detail}</small>
+                    </button>
+                    <button
+                      className="path-icon-button"
+                      type="button"
+                      onClick={() => deletePath(path.id)}
+                      title={`Delete ${path.name}`}
+                      aria-label={`Delete ${path.name}`}
+                      disabled={paths.length <= 1}
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="path-manager-meta">
+              <span>{selectedPathPoint?.pathId === activePathId ? `Dot ${selectedPathPoint.index + 1} selected` : 'No dot selected'}</span>
+            </div>
+          </div>,
+          pathManagerHost,
+        ) : null}
         <PresetManageButton
           panelId={presetPanelId}
           onManage={() => presetPanelId && setPresetModal({ mode: 'manage', panelId: presetPanelId })}
@@ -1105,3 +1264,4 @@ function Lab() {
 export default function App() {
   return <Lab />;
 }
+
